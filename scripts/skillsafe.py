@@ -1,0 +1,4571 @@
+#!/usr/bin/env python3
+"""
+SkillSafe — secured skill registry client for AI coding tools.
+
+A single-file Python client (stdlib only) that can scan, save, share, install,
+and verify skills from the SkillSafe registry. Designed to run inside
+Claude Code, Cursor, Windsurf, Codex, Gemini CLI, OpenCode, OpenClaw, and similar AI-assisted development tools.
+
+Usage:
+    python skillsafe.py init [path]                       # create skillsafe.yaml wizard
+    python skillsafe.py auth                              # browser login
+    python skillsafe.py scan <path>
+    python skillsafe.py save <path> --version <ver> [--description <d>] [--category <c>] [--tags <t>]
+    python skillsafe.py share <@namespace/skill> --version <ver> [--public] [--expires <1d|7d|30d|never>]
+    python skillsafe.py install <@namespace/skill> [--version <ver>] [--tool <name>] [--location project|global] [--skills-dir <override>]
+    python skillsafe.py install <share-link> [--tool <name>] [--location project|global] [--skills-dir <override>]
+    python skillsafe.py search <query> [--category <c>] [--sort <s>]
+    python skillsafe.py info <@namespace/skill>
+    python skillsafe.py list
+    python skillsafe.py update
+    python skillsafe.py whoami
+    python skillsafe.py backup <path> [--name <name>] [--version <ver>]
+    python skillsafe.py restore <@namespace/name> [--skills-dir <dir>] [--tool <name>] [-o <dir>]
+
+Also importable as a module:
+    from skillsafe import Scanner, SkillSafeClient
+
+References / Thanks:
+    https://github.com/kriskimmerle/skillsafe — rule taxonomy and detection patterns
+    OWASP Agentic AI Threat Taxonomy
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import io
+import json
+import os
+import re
+import secrets
+import shutil
+import sys
+import tarfile
+import tempfile
+import textwrap
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# ---------------------------------------------------------------------------
+# Python version guard
+# ---------------------------------------------------------------------------
+
+if sys.version_info < (3, 8):
+    print("Error: Python 3.8+ is required.", file=sys.stderr)
+    sys.exit(1)
+
+
+def _safe_extractall(tar: tarfile.TarFile, path: Union[str, Path]) -> None:
+    """Extract tarfile safely.  Uses the ``filter="data"`` parameter on
+    Python 3.12+ (which blocks absolute paths, traversals, and special
+    members).  On older Pythons we validate each member then extract
+    individually to avoid TOCTOU races."""
+    if sys.version_info >= (3, 12):
+        tar.extractall(path=path, filter="data")
+    else:
+        # Manual safety: reject absolute paths, traversals, symlinks,
+        # hardlinks, and special file types.  Extract member-by-member
+        # so the validated list cannot be swapped between check and use.
+        dest = os.path.realpath(path)
+        safe_members: list = []
+        for member in tar.getmembers():
+            member_path = os.path.normpath(member.name)
+            if member_path.startswith("/") or member_path.startswith("..") or "/../" in member_path:
+                raise tarfile.TarError(f"Path traversal in archive: {member.name}")
+            resolved = os.path.realpath(os.path.join(dest, member_path))
+            if not resolved.startswith(dest + os.sep) and resolved != dest:
+                raise tarfile.TarError(f"Path escapes destination: {member.name}")
+            # Block symlinks entirely — skills should never contain them
+            if member.issym():
+                raise tarfile.TarError(f"Blocked symlink: {member.name} -> {member.linkname}")
+            # Block hardlinks — they can reference arbitrary files on the host
+            if member.islnk():
+                raise tarfile.TarError(f"Blocked hardlink: {member.name} -> {member.linkname}")
+            if not (member.isfile() or member.isdir()):
+                raise tarfile.TarError(f"Blocked special member: {member.name}")
+            safe_members.append(member)
+        tar.extractall(path=path, members=safe_members)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+VERSION = "0.1.2"
+RULESET_VERSION = "2026.03.01"
+SCANNER_TOOL = "skillsafe-scanner-py"
+DEFAULT_API_BASE = "https://api.skillsafe.ai"
+
+CONFIG_DIR = Path.home() / ".skillsafe"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+SKILLS_DIR = CONFIG_DIR / "skills"
+CACHE_DIR = CONFIG_DIR / "cache"
+BLOB_CACHE_DIR = CACHE_DIR / "blobs"
+
+TOOL_SKILLS_DIRS: Dict[str, Path] = {
+    "claude": Path.home() / ".claude" / "skills",
+    "cursor": Path.home() / ".cursor" / "skills",
+    "windsurf": Path.home() / ".windsurf" / "skills",
+    "codex": Path.home() / ".agents" / "skills",
+    "gemini": Path.home() / ".gemini" / "skills",
+    "opencode": Path.home() / ".config" / "opencode" / "skills",
+    "openclaw": Path.home() / ".openclaw" / "workspace" / "skills",
+    # Extended integrations
+    "cline": Path.home() / ".cline" / "skills",
+    "roo": Path.home() / ".roo" / "skills",
+    "goose": Path.home() / ".config" / "goose" / "skills",
+    "copilot": Path.home() / ".config" / "github-copilot" / "skills",
+    "kiro": Path.home() / ".kiro" / "skills",
+    "trae": Path.home() / ".trae" / "skills",
+    "amp": Path.home() / ".amp" / "skills",
+    "aider": Path.home() / ".aider" / "skills",
+    "vscode": Path.home() / ".vscode" / "skills",
+    # New integrations matching skills.sh parity
+    "antigravity": Path.home() / ".gemini" / "antigravity" / "global_skills",
+    "clawdbot": Path.home() / ".clawdbot" / "skills",
+    "droid": Path.home() / ".factory" / "skills",
+    "kilo": Path.home() / ".kilocode" / "skills",
+}
+TOOL_DISPLAY_NAMES: Dict[str, str] = {
+    "claude": "Claude Code",
+    "cursor": "Cursor",
+    "windsurf": "Windsurf",
+    "codex": "Codex",
+    "gemini": "Gemini CLI",
+    "opencode": "OpenCode",
+    "openclaw": "OpenClaw",
+    "cline": "Cline",
+    "roo": "Roo Code",
+    "goose": "Goose",
+    "copilot": "GitHub Copilot",
+    "kiro": "Kiro",
+    "trae": "Trae",
+    "amp": "AMP",
+    "aider": "Aider",
+    "vscode": "VS Code",
+    "antigravity": "Antigravity",
+    "clawdbot": "ClawdBot",
+    "droid": "Droid",
+    "kilo": "Kilo Code",
+}
+# Project-level skills directories (relative to cwd) — not all tools use .<tool>/skills/
+TOOL_PROJECT_SKILLS_SUBDIRS: Dict[str, str] = {
+    "claude": ".claude/skills",
+    "cursor": ".cursor/skills",
+    "windsurf": ".windsurf/skills",
+    "codex": ".agents/skills",
+    "gemini": ".gemini/skills",
+    "opencode": ".opencode/skills",
+    "openclaw": "skills",
+    "cline": ".cline/skills",
+    "roo": ".roo/skills",
+    "goose": ".goose/skills",
+    "copilot": ".github/copilot/skills",
+    "kiro": ".kiro/skills",
+    "trae": ".trae/skills",
+    "amp": ".amp/skills",
+    "aider": ".aider/skills",
+    "vscode": ".vscode/skills",
+    "antigravity": ".agent/skills",
+    "clawdbot": "skills",
+    "droid": ".factory/skills",
+    "kilo": ".kilocode/skills",
+}
+
+MAX_ARCHIVE_SIZE = 10 * 1024 * 1024  # 10 MB
+
+# Binary file extensions that should not be bundled in skills
+BINARY_EXTENSIONS = {
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".elf",
+    ".o", ".a", ".ko", ".sys", ".drv",
+    ".deb", ".rpm", ".msi", ".pkg",
+    ".pyc", ".pyo", ".pyd",
+}
+
+# Module-level update check state — set by _request(), read by _print_update_notice()
+_update_available: Optional[str] = None  # latest version if newer than VERSION, else None
+
+
+def _parse_semver(v: str) -> Tuple[int, ...]:
+    """Parse a semver string into a tuple of ints for comparison."""
+    m = re.match(r'^(\d+)\.(\d+)\.(\d+)', v)
+    if not m:
+        return (0, 0, 0)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def _check_version_header(headers: Any) -> None:
+    """Read X-SkillSafe-CLI-Latest from response headers and set _update_available."""
+    global _update_available
+    if _update_available is not None:
+        return  # Already detected, don't re-check
+    try:
+        latest = headers.get("X-SkillSafe-CLI-Latest", "")
+        if not isinstance(latest, str) or not latest:
+            return
+        if not re.match(r'^\d+\.\d+\.\d+', latest):
+            return
+        if _parse_semver(latest) > _parse_semver(VERSION):
+            _update_available = latest
+    except Exception:
+        return  # Never let version check break normal operation
+
+
+def _print_update_notice() -> None:
+    """Print an update notice if a newer CLI version was detected."""
+    if _update_available:
+        print(f"\n{yellow(f'Update available: v{VERSION} → v{_update_available}')}")
+        print(f"  Run: {bold('python3 scripts/skillsafe.py update')}\n")
+
+
+def _mask_api_key(key: str) -> str:
+    """Return a masked version of an API key showing only prefix and last 4 chars."""
+    if len(key) <= 8:
+        return key[:2] + "****"
+    return key[:4] + "..." + key[-4:]
+
+# Skill names reserved by SkillSafe (managed/updated by skillsafe.ai)
+RESERVED_SKILL_NAMES = {"skillsafe"}
+
+# File extensions we scan as text
+TEXT_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
+    ".md", ".txt", ".json", ".yaml", ".yml", ".toml",
+    ".sh", ".bash", ".zsh", ".fish",
+    ".html", ".css", ".xml", ".csv",
+    ".env", ".cfg", ".ini", ".conf",
+}
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class SkillSafeError(Exception):
+    """Error returned by the SkillSafe API."""
+
+    def __init__(self, code: str, message: str, status: int = 0, retry_after: Optional[int] = None):
+        self.code = code
+        self.message = message
+        self.status = status
+        self.retry_after = retry_after  # seconds from Retry-After header (GAP-7.3)
+        super().__init__(f"[{code}] {message}")
+
+
+class ScanError(Exception):
+    """Error during local security scanning."""
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+
+def load_config() -> Dict[str, Any]:
+    """Load ~/.skillsafe/config.json or return empty dict."""
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "r") as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                print("Warning: Config file corrupted, using defaults", file=sys.stderr)
+                return {}
+    return {}
+
+
+def save_config(cfg: Dict[str, Any]) -> None:
+    """Write config to ~/.skillsafe/config.json atomically, creating dirs as needed."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    # Restrict directory so other users cannot list contents
+    try:
+        os.chmod(CONFIG_DIR, 0o700)
+    except OSError:
+        pass
+    # Atomic write: write to temp file then rename to avoid corruption on crash
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=CONFIG_DIR, prefix=".config_", suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, str(CONFIG_FILE))
+    except BaseException:
+        # Clean up temp file on any failure
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def require_config() -> Dict[str, Any]:
+    """Load config or exit with an error if not configured."""
+    cfg = load_config()
+    if not cfg.get("api_key"):
+        print("Error: Not authenticated. Run 'skillsafe auth <username>' first.", file=sys.stderr)
+        sys.exit(1)
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+# ANSI colours (disabled if not a TTY)
+_USE_COLOR = hasattr(sys.stdout, "isatty") and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _c(code: str, text: str) -> str:
+    if _USE_COLOR:
+        return f"\033[{code}m{text}\033[0m"
+    return text
+
+
+def red(t: str) -> str:
+    return _c("31", t)
+
+
+def yellow(t: str) -> str:
+    return _c("33", t)
+
+
+def green(t: str) -> str:
+    return _c("32", t)
+
+
+def cyan(t: str) -> str:
+    return _c("36", t)
+
+
+def bold(t: str) -> str:
+    return _c("1", t)
+
+
+def dim(t: str) -> str:
+    return _c("2", t)
+
+
+SEVERITY_COLOR = {
+    "critical": red,
+    "high": red,
+    "medium": yellow,
+    "low": cyan,
+    "info": dim,
+}
+
+
+def format_severity(sev: str) -> str:
+    fn = SEVERITY_COLOR.get(sev, str)
+    return fn(sev.upper().ljust(8))
+
+
+# ---------------------------------------------------------------------------
+# Scanner
+# ---------------------------------------------------------------------------
+
+
+class Scanner:
+    """
+    Security scanner for skill directories.
+
+    Performs eight scan passes:
+      1. Python static analysis (AST-based)
+      2. JavaScript / TypeScript static analysis (regex-based)
+      3. Secret detection (regex on all text files)
+      4. Prompt injection detection (regex on .md files)
+      5. Shell / general threat patterns (exfil, persistence, reverse shell, recon, …)
+      6. Binary file detection (bundled executables/libraries)
+      7. base64 deep-scan (decode blobs and re-check for dangerous payloads)
+      8. Unicode obfuscation detection (zero-width chars, Cyrillic/Latin homographs)
+    """
+
+    # -- Dangerous Python function patterns (AST-based) ---------------------
+
+    # (func_type, match_spec, rule_id, severity, message)
+    # func_type: "name" for bare Name nodes, "attr" for Attribute nodes
+    _PY_DANGEROUS_CALLS: List[Tuple[str, Any, str, str, str]] = [
+        ("name", "eval", "py_eval", "high", "eval() can execute arbitrary code"),
+        ("name", "exec", "py_exec", "high", "exec() can execute arbitrary code"),
+        ("name", "compile", "py_compile", "medium", "compile() can compile arbitrary code"),
+        ("name", "__import__", "py_dunder_import", "high", "__import__() enables dynamic imports"),
+        ("attr", ("importlib", "import_module"), "py_importlib", "high", "importlib.import_module() enables dynamic imports"),
+        ("attr", ("os", "system"), "py_os_system", "high", "os.system() executes shell commands"),
+        ("attr", ("os", "popen"), "py_os_popen", "high", "os.popen() executes shell commands"),
+        ("attr", ("subprocess", "call"), "py_subprocess_call", "high", "subprocess.call() executes external commands"),
+        ("attr", ("subprocess", "run"), "py_subprocess_run", "high", "subprocess.run() executes external commands"),
+        ("attr", ("subprocess", "Popen"), "py_subprocess_popen", "high", "subprocess.Popen() executes external commands"),
+        ("attr", ("subprocess", "check_output"), "py_subprocess_check_output", "high", "subprocess.check_output() executes external commands"),
+        ("attr", ("subprocess", "check_call"), "py_subprocess_check_call", "high", "subprocess.check_call() executes external commands"),
+        ("attr", ("subprocess", "getoutput"), "py_subprocess_getoutput", "high", "subprocess.getoutput() executes external commands"),
+        ("attr", ("subprocess", "getstatusoutput"), "py_subprocess_getstatusoutput", "high", "subprocess.getstatusoutput() executes external commands"),
+    ]
+
+    # -- JS / TS dangerous patterns (regex) ---------------------------------
+
+    _JS_PATTERNS: List[Tuple[str, str, str, str]] = [
+        (r"\beval\s*\(", "js_eval", "high", "eval() can execute arbitrary code"),
+        (r"\bnew\s+Function\s*\(", "js_function_constructor", "high", "Function() constructor can execute arbitrary code"),
+        (r"""require\s*\(\s*['"]child_process['"]\s*\)""", "js_child_process", "high", "child_process module enables shell command execution"),
+        (r"\b(?:execSync|execFileSync)\s*\(", "js_exec_sync", "high", "execSync() executes shell commands synchronously"),
+        (r"\b(?:spawnSync)\s*\(", "js_spawn_sync", "high", "spawnSync() executes external commands"),
+        (r"""import\s+.*\bfrom\s+['"]child_process['"]""", "js_child_process_import", "high", "child_process ES module import enables shell command execution"),
+        (r"""import\s+.*\bfrom\s+['"]fs['"]""", "js_fs_import", "medium", "fs ES module import enables filesystem access"),
+    ]
+
+    # Compiled once
+    _JS_COMPILED: Optional[List[Tuple[re.Pattern, str, str, str]]] = None
+
+    # -- Secret detection patterns ------------------------------------------
+
+    _SECRET_PATTERNS: List[Tuple[str, str, str, str]] = [
+        (r"AKIA[0-9A-Z]{16}", "aws_access_key", "critical", "AWS Access Key ID detected"),
+        (r"-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----", "private_key", "critical", "Private key detected"),
+        (r"gh[pousr]_[A-Za-z0-9_]{36,}", "github_token", "critical", "GitHub token detected"),
+        (r"xox[bpars]-[0-9a-zA-Z\-]{10,}", "slack_token", "high", "Slack token detected"),
+        (
+            r"""['"]?[a-zA-Z_]*(?:api[_\-]?key|secret[_\-]?key|access[_\-]?token|auth[_\-]?token|password)['"]?\s*[:=]\s*['"][a-zA-Z0-9+/=_\-]{16,}['"]""",
+            "generic_secret",
+            "high",
+            "Possible hardcoded secret or API key",
+        ),
+    ]
+
+    _SECRET_COMPILED: Optional[List[Tuple[re.Pattern, str, str, str]]] = None
+
+    # -- Prompt injection patterns ------------------------------------------
+
+    _INJECTION_PATTERNS: List[Tuple[str, str, str, str]] = [
+        (r"ignore\s+(?:all\s+)?(?:(?:previous|prior|above)\s+)?instructions", "prompt_ignore_instructions", "high", "Prompt injection: ignore instructions"),
+        (r"you\s+are\s+now", "prompt_role_hijack", "high", "Prompt injection: role hijacking"),
+        (r"system\s+prompt", "prompt_system_prompt", "medium", "Prompt injection: system prompt reference"),
+        (r"disregard\s+(?:all\s+)?(?:(?:previous|prior)\s+)?instructions", "prompt_disregard", "high", "Prompt injection: disregard instructions"),
+        (r"new\s+instructions\s*:", "prompt_new_instructions", "high", "Prompt injection: new instructions block"),
+        (r"override\s+(?:(?:previous|prior)\s+)?instructions", "prompt_override", "high", "Prompt injection: override instructions"),
+        (r"forget\s+(?:everything|all|previous)", "prompt_forget", "high", "Prompt injection: forget instructions"),
+        (r"do\s+not\s+follow\s+(?:the\s+)?(?:(?:previous|prior|above)\s+)?instructions", "prompt_do_not_follow", "high", "Prompt injection: do not follow instructions"),
+    ]
+
+    _INJECTION_COMPILED: Optional[List[Tuple[re.Pattern, str, str, str]]] = None
+    _INJECTION_EXTENSIONS: frozenset = frozenset({".md", ".txt", ".yaml", ".yml", ".rst"})
+
+    # -- Shell / general threat patterns (SS03-SS22) ------------------------
+    # Applied to all text files. Each tuple: (pattern, rule_id, severity, message)
+
+    _SHELL_THREAT_PATTERNS: List[Tuple[str, str, str, str]] = [
+        # SS03 – Data exfiltration to known collection services
+        (r"(?:curl|wget).*(?:ngrok\.io|requestbin\.com|webhook\.site|pipedream\.net|canarytokens|burpcollaborator)", "shell_exfil_service", "high", "Data exfiltration to known collection service (SS03)"),
+
+        # SS04 – Agent memory / instruction file poisoning
+        (r">\s*(?:MEMORY\.md|SOUL\.md|CLAUDE\.md|\.cursorrules)", "agent_memory_write", "high", "Writing to agent memory/instruction file (SS04)"),
+        (r"echo\s+.*>>?\s*(?:MEMORY\.md|SOUL\.md|CLAUDE\.md|\.cursorrules)", "agent_memory_inject", "high", "Injecting content into agent memory file (SS04)"),
+
+        # SS07 – Privilege escalation
+        (r"\bsudo\s+(?:su|bash|sh|-s|-i)\b", "priv_escalation_sudo", "high", "Privilege escalation via sudo shell (SS07)"),
+        (r"\bseteuid\s*\(\s*0\s*\)|\bsetuid\s*\(\s*0\s*\)", "priv_setuid_root", "critical", "Setting UID/EUID to root (SS07)"),
+
+        # SS08 – Persistence mechanisms
+        (r"crontab\s+-[le]|@reboot|/etc/cron\b", "persistence_cron", "high", "Persistence via cron (SS08)"),
+        (r"~/Library/LaunchAgents|/Library/LaunchAgents|~/Library/LaunchDaemons|/Library/LaunchDaemons", "persistence_launchd", "high", "Persistence via macOS LaunchAgent/LaunchDaemon (SS08)"),
+        (r"systemctl\s+enable\s+|/etc/systemd/system/.*\.service", "persistence_systemd", "high", "Persistence via systemd service (SS08)"),
+        (r"echo\s+.*>>?\s*~/?\.(bash_profile|bashrc|zshrc|profile|bash_login|zprofile)", "persistence_shell_profile", "medium", "Modifying shell profile for persistence (SS08)"),
+
+        # SS09 – Reverse shell
+        (r"/dev/tcp/\d|/dev/udp/\d", "reverse_shell_devtcp", "critical", "Reverse shell via /dev/tcp or /dev/udp (SS09)"),
+        (r"(?:nc|ncat|netcat)\s+[^;|]*-[eEcClL]|-[eEcClL]\s+[^;|]*(?:nc|ncat|netcat)\b", "reverse_shell_netcat", "critical", "Reverse shell via netcat -e/-l (SS09)"),
+        (r"socat\s+[^;|]*(?:EXEC|exec).*TCP", "reverse_shell_socat", "critical", "Reverse shell via socat (SS09)"),
+        (r"bash\s+-[iI]\s*>&?\s*/dev/tcp", "reverse_shell_bash", "critical", "Bash reverse shell (SS09)"),
+
+        # SS11 – ClickFix social engineering
+        (r"(?:open|launch)\s+(?:a\s+)?terminal\s+and\s+(?:paste|run|type|execute)", "clickfix_terminal", "high", "ClickFix: instruction to open terminal and run command (SS11)"),
+        (r"(?:copy|paste)\s+(?:this\s+)?(?:command|code|script)\s+(?:into|to)\s+(?:your\s+)?(?:terminal|console|command\s+prompt)", "clickfix_copy_paste", "high", "ClickFix: copy-paste terminal instruction (SS11)"),
+        (r"press\s+(?:win|windows|cmd)\s*\+\s*r\s+and", "clickfix_run_dialog", "high", "ClickFix: Windows Run dialog social engineering (SS11)"),
+
+        # SS13 – Dangerous file / disk operations
+        (r"\brm\s+(?:-[rRfv]+\s+)*(?:/[^/\s]|~/|~\s|/\s|\$HOME/?[\s;|])", "dangerous_rm_root", "critical", "Dangerous rm targeting root or home directory (SS13)"),
+        (r"\bdd\s+.*\bof=/dev/(?:sd[a-z]|hd[a-z]|nvme\d|xvd[a-z]|vd[a-z])", "dangerous_dd_device", "critical", "dd writing to block device — data destruction (SS13)"),
+
+        # SS14 – Reconnaissance
+        (r"\bnmap\b|\bmasscan\b|\barp-scan\b|\bzmap\b|\bunicornscan\b", "recon_portscan", "high", "Network port scanning tool detected (SS14)"),
+        (r"169\.254\.169\.254", "cloud_metadata_imds", "critical", "AWS/Azure/GCP instance metadata service endpoint (SS14)"),
+        (r"metadata\.google\.internal", "cloud_metadata_gcp", "critical", "GCP metadata server access (SS14)"),
+        (r"100\.100\.100\.200", "cloud_metadata_alibaba", "high", "Alibaba Cloud metadata endpoint (SS14)"),
+
+        # SS17 – Credential file reading
+        (r"(?:cat|read|open)\s+.*~?(?:/home/[^/]+)?/\.aws/credentials", "cred_read_aws", "critical", "Reading AWS credentials file (SS17)"),
+        (r"(?:cat|read|open)\s+.*~?(?:/home/[^/]+)?/\.docker/config\.json", "cred_read_docker", "critical", "Reading Docker config (may contain registry tokens) (SS17)"),
+        (r"find\s+.*(?:\.ssh|\.aws|\.gnupg|\.config/gcloud)\s", "cred_find_dirs", "high", "Searching credential directories (SS17)"),
+
+        # SS18 – Cryptocurrency targeting
+        (r"(?:seed\s+phrase|mnemonic\s+phrase|secret\s+recovery\s+phrase|wallet\s+recovery\s+phrase)", "crypto_seed_phrase", "critical", "Cryptocurrency seed/recovery phrase reference (SS18)"),
+        (r"(?:MetaMask|Phantom|Exodus|Electrum|Wasabi|Trezor|Ledger)\s+(?:wallet|keystore|password|seed|mnemon)", "crypto_wallet_software", "high", "Cryptocurrency wallet credential reference (SS18)"),
+        (r"~/\.(?:ethereum|bitcoin|litecoin|monero|dogecoin)|~/Library/(?:Ethereum|Bitcoin)", "crypto_wallet_dir", "high", "Cryptocurrency wallet directory access (SS18)"),
+
+        # SS19/SS20 – Path traversal & sensitive file reads
+        (r"(?:\.\.\/){2,}(?:etc|usr|root|home|sys|proc|var)", "path_traversal_sys", "high", "Directory traversal to system path (SS19)"),
+        (r"(?:cat|head|tail)\s+/etc/(?:passwd|shadow|sudoers|hosts)", "sensitive_sys_read", "critical", "Reading sensitive system file (SS20)"),
+        (r"\.git/hooks/(?:pre-commit|post-commit|post-merge|pre-push|post-receive)\b", "git_hook_persist", "medium", "Git hook file reference — possible persistence (SS20)"),
+
+        # SS05 – base64 decode-then-execute (pattern-level; deep-scan handled in pass 7)
+        (r"\|\s*base64\s+(?:-d|--decode)\s*\|\s*(?:bash|sh|python3?|perl|ruby)\b", "b64_decode_exec", "critical", "base64 decoded content piped to shell (SS05)"),
+        (r"base64\s+(?:-d|--decode)\s+[a-zA-Z0-9._-]+\s*\|\s*(?:bash|sh)\b", "b64_file_exec", "critical", "base64 decoded file executed as shell (SS05)"),
+    ]
+
+    _SHELL_THREAT_COMPILED: Optional[List[Tuple[re.Pattern, str, str, str]]] = None
+
+    # -- Unicode obfuscation patterns (SS10) --------------------------------
+    # Note: uses non-raw strings so \uXXXX escapes are interpreted by Python.
+
+    _OBFUSCATION_PATTERNS: List[Tuple[str, str, str, str]] = [
+        ("\u200b|\u200c|\u200d|\u2060|\ufeff", "unicode_zero_width", "high", "Zero-width Unicode character detected — possible obfuscation (SS10)"),
+        ("[а-яА-ЯёЁ][a-zA-Z]|[a-zA-Z][а-яА-ЯёЁ]", "unicode_cyrillic_mix", "high", "Cyrillic characters mixed with Latin — possible IDN homograph attack (SS10)"),
+    ]
+
+    _OBFUSCATION_COMPILED: Optional[List[Tuple[re.Pattern, str, str, str]]] = None
+
+    # -- base64 deep-scan compiled patterns ---------------------------------
+    _B64_RE: Optional[re.Pattern] = None
+    _DANGER_RE: Optional[re.Pattern] = None
+
+    # -- Severity penalties for scoring -------------------------------------
+
+    _SEVERITY_PENALTIES: Dict[str, int] = {
+        "critical": 25,
+        "high": 15,
+        "medium": 5,
+        "low": 2,
+        "info": 0,
+    }
+
+    # -- Initialisation -----------------------------------------------------
+
+    def __init__(self) -> None:
+        # Lazy-compile regexes on first use
+        if Scanner._JS_COMPILED is None:
+            Scanner._JS_COMPILED = [
+                (re.compile(p), rid, sev, msg) for p, rid, sev, msg in Scanner._JS_PATTERNS
+            ]
+        if Scanner._SECRET_COMPILED is None:
+            Scanner._SECRET_COMPILED = [
+                (re.compile(p), rid, sev, msg) for p, rid, sev, msg in Scanner._SECRET_PATTERNS
+            ]
+        if Scanner._INJECTION_COMPILED is None:
+            Scanner._INJECTION_COMPILED = [
+                (re.compile(p, re.IGNORECASE), rid, sev, msg) for p, rid, sev, msg in Scanner._INJECTION_PATTERNS
+            ]
+        if Scanner._SHELL_THREAT_COMPILED is None:
+            Scanner._SHELL_THREAT_COMPILED = [
+                (re.compile(p, re.IGNORECASE), rid, sev, msg) for p, rid, sev, msg in Scanner._SHELL_THREAT_PATTERNS
+            ]
+        if Scanner._OBFUSCATION_COMPILED is None:
+            Scanner._OBFUSCATION_COMPILED = [
+                (re.compile(p, re.UNICODE), rid, sev, msg) for p, rid, sev, msg in Scanner._OBFUSCATION_PATTERNS
+            ]
+        if Scanner._B64_RE is None:
+            Scanner._B64_RE = re.compile(r'[A-Za-z0-9+/]{40,}={0,2}')
+            Scanner._DANGER_RE = re.compile(
+                r'curl[^;|]*\|\s*(?:bash|sh)\b'
+                r'|/dev/tcp/'
+                r'|\brm\s+-[rRf]+\s+/'
+                r'|wget[^;|]*\|\s*(?:bash|sh)\b'
+                r'|python\s+-c\s+["\']import\s+socket'
+                r'|nc\s+.*-[eElL]',
+                re.IGNORECASE,
+            )
+
+    # -- Public API ---------------------------------------------------------
+
+    def scan(self, path: str | Path, tree_hash: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Scan a skill directory and return a scan report dict.
+
+        Args:
+            path: Path to the skill directory.
+            tree_hash: Optional pre-computed tree hash to embed in the report.
+
+        Returns:
+            Scan report dict matching the SkillSafe schema.
+        """
+        path = Path(path).resolve()
+        if not path.is_dir():
+            raise ScanError(f"Not a directory: {path}")
+
+        all_findings: List[Dict[str, Any]] = []
+
+        # Collect files
+        files = self._collect_files(path)
+
+        # Pass 1: Python AST analysis
+        py_findings = []
+        for fpath in files:
+            if fpath.suffix == ".py":
+                py_findings.extend(self._scan_python_ast(fpath, path))
+        all_findings.extend(py_findings)
+
+        # Pass 2: JS/TS regex analysis
+        js_findings = []
+        for fpath in files:
+            if fpath.suffix in (".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"):
+                js_findings.extend(self._scan_js_regex(fpath, path))
+        all_findings.extend(js_findings)
+
+        # Pass 3: Secret detection (all text files)
+        secret_findings = []
+        for fpath in files:
+            if fpath.suffix in TEXT_EXTENSIONS:
+                secret_findings.extend(self._scan_secrets(fpath, path))
+        all_findings.extend(secret_findings)
+
+        # Pass 4: Prompt injection (text-like files)
+        injection_findings = []
+        for fpath in files:
+            if fpath.suffix.lower() in Scanner._INJECTION_EXTENSIONS:
+                injection_findings.extend(self._scan_prompt_injection(fpath, path))
+        all_findings.extend(injection_findings)
+
+        # Pass 5: Shell / general threat patterns (all text files)
+        shell_findings = []
+        for fpath in files:
+            if fpath.suffix in TEXT_EXTENSIONS:
+                shell_findings.extend(self._scan_shell_threats(fpath, path))
+        all_findings.extend(shell_findings)
+
+        # Pass 6: Binary file detection
+        all_findings.extend(self._scan_binary_files(files, path))
+
+        # Pass 7: base64 deep-scan (text files)
+        b64_findings = []
+        for fpath in files:
+            if fpath.suffix in TEXT_EXTENSIONS:
+                b64_findings.extend(self._scan_base64_deep(fpath, path))
+        all_findings.extend(b64_findings)
+
+        # Pass 8: Unicode obfuscation (all text files)
+        obfuscation_findings = []
+        for fpath in files:
+            if fpath.suffix in TEXT_EXTENSIONS:
+                obfuscation_findings.extend(self._scan_obfuscation(fpath, path))
+        all_findings.extend(obfuscation_findings)
+
+        # Build summary (deduplicated list for server comparison)
+        findings_summary = [
+            {"rule_id": f["rule_id"], "severity": f["severity"], "file": f["file"], "line": f["line"], "message": f["message"]}
+            for f in all_findings
+        ]
+
+        is_clean = len(all_findings) == 0
+        score, grade = self._calculate_score(all_findings)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        report: Dict[str, Any] = {
+            "schema_version": "1.0",
+            "scanner": {
+                "tool": SCANNER_TOOL,
+                "version": VERSION,
+                "ruleset_version": RULESET_VERSION,
+            },
+            "clean": is_clean,
+            "findings_count": len(all_findings),
+            "findings_summary": findings_summary,
+            "score": score,
+            "grade": grade,
+            "timestamp": now,
+        }
+        if tree_hash:
+            report["skill_tree_hash"] = tree_hash
+
+        return report
+
+    # -- File collection ----------------------------------------------------
+
+    def _collect_files(self, root: Path) -> List[Path]:
+        """Recursively collect files, skipping hidden dirs and common junk."""
+        skip_dirs = {".git", ".svn", "node_modules", "__pycache__", ".venv", "venv", ".skillsafe"}
+        result: List[Path] = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            # Prune hidden / ignored directories in-place
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
+            for fname in filenames:
+                if fname.startswith("."):
+                    continue
+                result.append(Path(dirpath) / fname)
+        return sorted(result)
+
+    # -- Pass 1: Python AST -------------------------------------------------
+
+    def _scan_python_ast(self, fpath: Path, root: Path) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        rel = str(fpath.relative_to(root))
+
+        try:
+            source = fpath.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(source, filename=rel)
+        except SyntaxError:
+            # Can't parse — skip (could be Python 2, template, etc.)
+            return findings
+        except Exception:
+            return findings
+
+        source_lines = source.splitlines()
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+
+            for func_type, match_spec, rule_id, severity, message in self._PY_DANGEROUS_CALLS:
+                matched = False
+
+                if func_type == "name" and isinstance(func, ast.Name):
+                    if func.id == match_spec:
+                        matched = True
+                elif func_type == "attr" and isinstance(func, ast.Attribute):
+                    mod_name, attr_name = match_spec
+                    if func.attr == attr_name and isinstance(func.value, ast.Name) and func.value.id == mod_name:
+                        matched = True
+
+                if matched:
+                    lineno = getattr(node, "lineno", 0)
+                    context = source_lines[lineno - 1].strip() if 0 < lineno <= len(source_lines) else ""
+                    findings.append({
+                        "rule_id": rule_id,
+                        "severity": severity,
+                        "file": rel,
+                        "line": lineno,
+                        "message": message,
+                        "context": context,
+                    })
+                    break  # One match per call node
+
+        return findings
+
+    # -- Pass 2: JS / TS regex ----------------------------------------------
+
+    def _scan_js_regex(self, fpath: Path, root: Path) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        rel = str(fpath.relative_to(root))
+        assert self._JS_COMPILED is not None
+
+        try:
+            lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return findings
+
+        in_block_comment = False
+        for lineno_0, line in enumerate(lines):
+            stripped = line.lstrip()
+
+            # Track multi-line block comment state
+            if in_block_comment:
+                if "*/" in stripped:
+                    in_block_comment = False
+                    # There may be code after the closing */
+                    after_close = stripped.split("*/", 1)[1].strip()
+                    if after_close:
+                        stripped = after_close
+                        # Fall through to scan the remainder
+                    else:
+                        continue
+                else:
+                    continue
+            # Skip single-line comments
+            elif stripped.startswith("//"):
+                continue
+            # Detect block comment start
+            elif stripped.startswith("/*"):
+                if "*/" not in stripped[2:]:
+                    in_block_comment = True
+                    continue
+                else:
+                    # Inline block comment: /* ... */ code
+                    after_close = stripped.split("*/", 1)[1].strip()
+                    if after_close:
+                        stripped = after_close
+                        # Fall through to scan the remainder
+                    else:
+                        continue
+            # Skip JSDoc/block comment continuation lines
+            elif stripped == "*" or stripped == "*/":
+                continue
+            # For JSDoc `* text` lines, strip the leading `* ` and scan the remainder
+            elif stripped.startswith("* ") or stripped.startswith("*\t"):
+                stripped = stripped[2:]
+                # Fall through to scan the remainder
+
+            # Strip inline block comments from remaining code: code /* ... */ more_code
+            # Strip inline block comments from code (e.g., `code /* comment */ more`)
+            # Only strip when /* appears before */ to avoid mishandling string
+            # literals that contain these sequences (known limitation of regex scanning)
+            while "/*" in stripped and "*/" in stripped:
+                idx_open = stripped.index("/*")
+                idx_close = stripped.index("*/")
+                if idx_open >= idx_close:
+                    break  # */ before /* — not a real inline comment
+                before = stripped[:idx_open]
+                after = stripped[idx_close + 2:]
+                stripped = (before + " " + after).strip()
+
+            for pattern, rule_id, severity, message in self._JS_COMPILED:
+                if pattern.search(stripped):
+                    findings.append({
+                        "rule_id": rule_id,
+                        "severity": severity,
+                        "file": rel,
+                        "line": lineno_0 + 1,
+                        "message": message,
+                        "context": stripped[:120],
+                    })
+
+        return findings
+
+    # -- Pass 3: Secret detection -------------------------------------------
+
+    def _scan_secrets(self, fpath: Path, root: Path) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        rel = str(fpath.relative_to(root))
+        assert self._SECRET_COMPILED is not None
+
+        try:
+            lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return findings
+
+        for lineno_0, line in enumerate(lines):
+            for pattern, rule_id, severity, message in self._SECRET_COMPILED:
+                if pattern.search(line):
+                    findings.append({
+                        "rule_id": rule_id,
+                        "severity": severity,
+                        "file": rel,
+                        "line": lineno_0 + 1,
+                        "message": message,
+                        "context": _redact_line(line.strip()),
+                    })
+
+        return findings
+
+    # -- Pass 4: Prompt injection -------------------------------------------
+
+    def _scan_prompt_injection(self, fpath: Path, root: Path) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        rel = str(fpath.relative_to(root))
+        assert self._INJECTION_COMPILED is not None
+
+        try:
+            lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return findings
+
+        for lineno_0, line in enumerate(lines):
+            for pattern, rule_id, severity, message in self._INJECTION_COMPILED:
+                if pattern.search(line):
+                    findings.append({
+                        "rule_id": rule_id,
+                        "severity": severity,
+                        "file": rel,
+                        "line": lineno_0 + 1,
+                        "message": message,
+                        "context": line.strip()[:120],
+                    })
+
+        return findings
+
+    # -- Pass 5: Shell / general threat patterns ----------------------------
+
+    def _scan_shell_threats(self, fpath: Path, root: Path) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        rel = str(fpath.relative_to(root))
+        assert self._SHELL_THREAT_COMPILED is not None
+
+        try:
+            lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return findings
+
+        for lineno_0, line in enumerate(lines):
+            for pattern, rule_id, severity, message in self._SHELL_THREAT_COMPILED:
+                if pattern.search(line):
+                    findings.append({
+                        "rule_id": rule_id,
+                        "severity": severity,
+                        "file": rel,
+                        "line": lineno_0 + 1,
+                        "message": message,
+                        "context": line.strip()[:120],
+                    })
+
+        return findings
+
+    # -- Pass 6: Binary file detection --------------------------------------
+
+    def _scan_binary_files(self, files: List[Path], root: Path) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        for fpath in files:
+            if fpath.suffix.lower() in BINARY_EXTENSIONS:
+                rel = str(fpath.relative_to(root))
+                findings.append({
+                    "rule_id": "binary_file_bundled",
+                    "severity": "high",
+                    "file": rel,
+                    "line": 0,
+                    "message": f"Binary file bundled in skill: {fpath.suffix} (SS16)",
+                    "context": fpath.name,
+                })
+        return findings
+
+    # -- Pass 7: base64 deep-scan -------------------------------------------
+
+    def _scan_base64_deep(self, fpath: Path, root: Path) -> List[Dict[str, Any]]:
+        """Decode suspicious base64 blobs and re-scan for dangerous payloads (SS05)."""
+        import base64 as _base64
+        findings: List[Dict[str, Any]] = []
+        rel = str(fpath.relative_to(root))
+
+        try:
+            content = fpath.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return findings
+
+        # Match blobs that look like base64 (>=40 chars, valid alphabet)
+        for lineno_0, line in enumerate(content.splitlines()):
+            for m in Scanner._B64_RE.finditer(line):
+                blob = m.group(0)
+                try:
+                    # Pad to multiple of 4 before decoding
+                    decoded = _base64.b64decode(blob + "==").decode("utf-8", errors="ignore")
+                except Exception:
+                    continue
+                if Scanner._DANGER_RE.search(decoded):
+                    findings.append({
+                        "rule_id": "b64_encoded_payload",
+                        "severity": "critical",
+                        "file": rel,
+                        "line": lineno_0 + 1,
+                        "message": "base64-encoded dangerous payload detected (SS05)",
+                        "context": blob[:40] + "...",
+                    })
+                    break  # One finding per line
+
+        return findings
+
+    # -- Pass 8: Unicode obfuscation ----------------------------------------
+
+    def _scan_obfuscation(self, fpath: Path, root: Path) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        rel = str(fpath.relative_to(root))
+        assert self._OBFUSCATION_COMPILED is not None
+
+        try:
+            lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return findings
+
+        for lineno_0, line in enumerate(lines):
+            for pattern, rule_id, severity, message in self._OBFUSCATION_COMPILED:
+                if pattern.search(line):
+                    findings.append({
+                        "rule_id": rule_id,
+                        "severity": severity,
+                        "file": rel,
+                        "line": lineno_0 + 1,
+                        "message": message,
+                        "context": repr(line.strip()[:80]),
+                    })
+
+        return findings
+
+    # -- Scoring ------------------------------------------------------------
+
+    def _calculate_score(self, findings: List[Dict[str, Any]]) -> Tuple[int, str]:
+        """Return (score 0-100, letter grade A+/A/B/C/D/F)."""
+        penalty = sum(self._SEVERITY_PENALTIES.get(f.get("severity", "info"), 0) for f in findings)
+        score = max(0, 100 - penalty)
+        if score == 100:
+            grade = "A+"
+        elif score >= 90:
+            grade = "A"
+        elif score >= 80:
+            grade = "B"
+        elif score >= 70:
+            grade = "C"
+        elif score >= 50:
+            grade = "D"
+        else:
+            grade = "F"
+        return score, grade
+
+
+def _redact_line(line: str) -> str:
+    """Redact a line that contains a detected secret.
+
+    The middle portion is replaced with ``****`` so that the raw secret
+    value is never included in the scan report uploaded to the server.
+    """
+    # Always redact: show first 20 chars + **** + last 4 chars
+    if len(line) > 24:
+        return line[:20] + "****" + line[-4:]
+    # Very short line — still mask the middle
+    return line[:4] + "****"
+
+
+# ---------------------------------------------------------------------------
+# Tree hash computation
+# ---------------------------------------------------------------------------
+
+
+def compute_tree_hash(data: bytes) -> str:
+    """
+    Compute the tree hash of an archive blob.
+
+    Matches the server implementation in api/src/services/skills.ts:
+        const archiveHash = await sha256Bytes(input.archiveData);
+        const treeHash = `sha256:${archiveHash}`;
+    """
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def compute_tree_hash_v2(files: list[dict]) -> str:
+    """
+    Compute the v2 tree hash from a file manifest.
+
+    Matches the server implementation in api/src/lib/hash.ts:computeTreeHashV2.
+    Files are sorted by path, each line is "path\\0hex\\n", concatenated, then
+    SHA-256 hashed with "sha256tree:" prefix.
+    """
+    sorted_files = sorted(files, key=lambda f: f["path"])
+    parts = []
+    for f in sorted_files:
+        h = f["hash"]
+        hex_hash = h[len("sha256:"):] if h.startswith("sha256:") else h
+        parts.append(f"{f['path']}\0{hex_hash}\n")
+    manifest = "".join(parts)
+    return "sha256tree:" + hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+
+
+def build_file_manifest(path: Path) -> list[dict]:
+    """
+    Walk a directory and build a v2 file manifest.
+
+    Returns a list of {"path": relative_path, "hash": "sha256:<hex>", "size": N}
+    for each file, using the same traversal rules as create_archive().
+    """
+    path = path.resolve()
+    skip_dirs = {".git", ".svn", "node_modules", "__pycache__", ".venv", "venv", ".skillsafe"}
+    files: list[dict] = []
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames[:] = sorted(d for d in dirnames if d not in skip_dirs and not d.startswith("."))
+        for fname in sorted(filenames):
+            if fname.startswith("."):
+                continue
+            fpath = Path(dirpath) / fname
+            # Guard against symlinks that escape the skill directory tree
+            if fpath.is_symlink():
+                resolved = fpath.resolve()
+                if not str(resolved).startswith(str(path) + os.sep) and resolved != path:
+                    continue
+            rel = str(fpath.relative_to(path))
+            content = fpath.read_bytes()
+            file_hash = "sha256:" + hashlib.sha256(content).hexdigest()
+            files.append({"path": rel, "hash": file_hash, "size": len(content)})
+
+    MAX_FILE_COUNT = 1000
+    if len(files) > MAX_FILE_COUNT:
+        raise SkillSafeError("too_many_files", f"Too many files ({len(files)}). Maximum is {MAX_FILE_COUNT}.")
+
+    return files
+
+
+# ---------------------------------------------------------------------------
+# Blob cache
+# ---------------------------------------------------------------------------
+
+
+_BLOB_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_SHARE_ID_RE = re.compile(r"^shr_[a-zA-Z0-9]{4,64}$")
+
+
+def _validate_share_id(share_id: str) -> None:
+    """Raise ValueError if share_id doesn't match expected shr_ format."""
+    if not _SHARE_ID_RE.match(share_id):
+        raise ValueError(f"Invalid share ID format: {share_id!r}")
+
+
+def _validate_blob_hash(blob_hash: str) -> None:
+    """Raise ValueError if blob_hash is not a valid sha256:<hex> string."""
+    if not _BLOB_HASH_RE.match(blob_hash):
+        raise ValueError(f"Invalid blob hash format: {blob_hash!r}")
+
+
+def get_cached_blob(blob_hash: str) -> Optional[bytes]:
+    """Check local blob cache. Returns bytes if cached and hash verified, else None."""
+    _validate_blob_hash(blob_hash)
+    cache_path = BLOB_CACHE_DIR / blob_hash
+    if not cache_path.exists():
+        return None
+    try:
+        data = cache_path.read_bytes()
+    except (OSError, IOError):
+        # GAP-4.2: Corrupted/unreadable cache entry (e.g. directory, permission
+        # denied, disk error) — delete and re-download instead of crashing
+        try:
+            cache_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    actual_hash = "sha256:" + hashlib.sha256(data).hexdigest()
+    if actual_hash != blob_hash:
+        # Corrupted cache entry — delete and re-download
+        cache_path.unlink(missing_ok=True)
+        return None
+    return data
+
+
+def cache_blob(blob_hash: str, data: bytes) -> None:
+    """Write blob to local cache atomically."""
+    _validate_blob_hash(blob_hash)
+    BLOB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = BLOB_CACHE_DIR / blob_hash
+    fd, tmp_path = tempfile.mkstemp(dir=str(BLOB_CACHE_DIR), prefix=".blob_")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, str(cache_path))
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Archive creation
+# ---------------------------------------------------------------------------
+
+
+def create_archive(path: Path) -> bytes:
+    """
+    Create a tar.gz archive of a directory, returning the raw bytes.
+
+    Produces deterministic output by sorting entries and zeroing timestamps.
+    """
+    path = path.resolve()
+    buf = io.BytesIO()
+
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        entries: List[Path] = []
+        skip_dirs = {".git", ".svn", "node_modules", "__pycache__", ".venv", "venv", ".skillsafe"}
+        for dirpath, dirnames, filenames in os.walk(path):
+            dirnames[:] = sorted(d for d in dirnames if d not in skip_dirs and not d.startswith("."))
+            for fname in sorted(filenames):
+                if fname.startswith("."):
+                    continue
+                entries.append(Path(dirpath) / fname)
+
+        MAX_FILE_COUNT = 1000
+        if len(entries) > MAX_FILE_COUNT:
+            raise SkillSafeError("too_many_files", f"Too many files ({len(entries)}). Maximum is {MAX_FILE_COUNT}.")
+
+        for fpath in entries:
+            # Guard against symlinks that escape the skill directory tree
+            if fpath.is_symlink():
+                resolved = fpath.resolve()
+                if not str(resolved).startswith(str(path) + os.sep) and resolved != path:
+                    print(f"Warning: Skipping symlink that escapes skill directory: {fpath} -> {resolved}", file=sys.stderr)
+                    continue
+            arcname = str(fpath.relative_to(path))
+            info = tar.gettarinfo(name=str(fpath), arcname=arcname)
+            # Zero out metadata for deterministic archives
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            info.mtime = 0
+            with open(fpath, "rb") as f:
+                tar.addfile(info, f)
+
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# HTTP API Client
+# ---------------------------------------------------------------------------
+
+
+class SkillSafeClient:
+    """
+    HTTP client for the SkillSafe API.
+
+    Uses only urllib (stdlib) — no external dependencies.
+    """
+
+    def __init__(self, api_base: Optional[str] = None, api_key: Optional[str] = None):
+        self.api_base = (api_base or DEFAULT_API_BASE).rstrip("/")
+        # Reject insecure HTTP connections (allow localhost/127.0.0.1 for dev)
+        if not self.api_base.startswith("https://"):
+            parsed = urllib.parse.urlparse(self.api_base)
+            if parsed.hostname not in ("localhost", "127.0.0.1"):
+                raise SkillSafeError(
+                    "insecure_connection",
+                    f"Refusing to connect over insecure HTTP to {self.api_base}. Use HTTPS.",
+                )
+        self.api_key = api_key
+
+    @staticmethod
+    def _encode_path_segment(segment: str) -> str:
+        """Percent-encode a URL path segment (defense-in-depth for library callers)."""
+        return urllib.parse.quote(segment, safe="")
+
+    # -- Low-level request --------------------------------------------------
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Optional[bytes] = None,
+        headers: Optional[Dict[str, str]] = None,
+        content_type: Optional[str] = None,
+        auth: bool = True,
+        raw_response: bool = False,
+    ) -> Any:
+        """
+        Make an HTTP request and return the parsed JSON response.
+
+        If raw_response=True, return (response_bytes, response_headers) instead.
+        """
+        url = self.api_base + path
+        hdrs: Dict[str, str] = headers or {}
+
+        if "User-Agent" not in hdrs:
+            hdrs["User-Agent"] = f"skillsafe-cli/{VERSION}"
+        if auth and self.api_key:
+            hdrs["Authorization"] = f"Bearer {self.api_key}"
+        if content_type:
+            hdrs["Content-Type"] = content_type
+
+        req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+
+        # Max sizes for response bodies to prevent OOM from malicious servers
+        _MAX_JSON_RESPONSE = 10 * 1024 * 1024  # 10 MB for JSON API responses
+        _MAX_RAW_RESPONSE = 50 * 1024 * 1024   # 50 MB for file downloads
+        _MAX_ERROR_BODY = 64 * 1024             # 64 KB for error responses
+
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                _check_version_header(resp.headers)
+                max_size = _MAX_RAW_RESPONSE if raw_response else _MAX_JSON_RESPONSE
+                data = resp.read(max_size + 1)
+                if len(data) > max_size:
+                    raise SkillSafeError("response_too_large", f"Response exceeds {max_size // (1024*1024)} MB limit", 0)
+                if raw_response:
+                    return data, resp.headers
+                try:
+                    return json.loads(data)
+                except json.JSONDecodeError:
+                    raise SkillSafeError("invalid_response", f"Server returned invalid JSON: {data[:200]!r}", 0)
+        except urllib.error.HTTPError as e:
+            _check_version_header(e.headers)
+            error_body = e.read(_MAX_ERROR_BODY).decode("utf-8", errors="replace")
+            # Parse Retry-After header for 429 responses (GAP-7.3)
+            retry_after: Optional[int] = None
+            if e.code == 429:
+                ra_header = e.headers.get("Retry-After", "")
+                try:
+                    retry_after = max(1, min(60, int(ra_header)))
+                except (ValueError, TypeError):
+                    retry_after = 5  # default 5s if header missing/invalid
+            try:
+                err = json.loads(error_body)
+                err_info = err.get("error", {})
+                raise SkillSafeError(
+                    code=err_info.get("code", "unknown"),
+                    message=err_info.get("message", error_body),
+                    status=e.code,
+                    retry_after=retry_after,
+                )
+            except SkillSafeError:
+                raise
+            except Exception:
+                raise SkillSafeError("http_error", f"HTTP {e.code}: {error_body}", e.code, retry_after=retry_after)
+        except urllib.error.URLError as e:
+            raise SkillSafeError("connection_error", f"Cannot connect to {self.api_base}: {e.reason}", 0)
+
+    # -- Multipart form-data builder ----------------------------------------
+
+    @staticmethod
+    def _build_multipart(fields: List[Tuple[str, str, bytes, str]]) -> Tuple[bytes, str]:
+        """
+        Build a multipart/form-data body.
+
+        Each field is (name, filename_or_empty, data, content_type).
+        Returns (body_bytes, content_type_header).
+        """
+        boundary = f"----SkillSafeBoundary{secrets.token_hex(16)}"
+        parts: List[bytes] = []
+
+        for name, filename, data, ct in fields:
+            # Sanitize name field to prevent CRLF injection
+            safe_name = name.replace("\r", "").replace("\n", "")
+            header_lines = [f"--{boundary}"]
+            if filename:
+                # Sanitize filename: escape backslashes/quotes, strip CRLF to prevent header injection
+                safe_filename = filename.replace("\\", "\\\\").replace('"', '\\"')
+                safe_filename = safe_filename.replace("\r", "").replace("\n", "")
+                header_lines.append(f'Content-Disposition: form-data; name="{safe_name}"; filename="{safe_filename}"')
+            else:
+                header_lines.append(f'Content-Disposition: form-data; name="{safe_name}"')
+            safe_ct = ct.replace("\r", "").replace("\n", "")
+            header_lines.append(f"Content-Type: {safe_ct}")
+            header_lines.append("")
+            header_bytes = "\r\n".join(header_lines).encode("utf-8")
+            parts.append(header_bytes + b"\r\n" + data)
+
+        body = b"\r\n".join(parts) + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        content_type = f"multipart/form-data; boundary={boundary}"
+        return body, content_type
+
+    # -- API methods --------------------------------------------------------
+
+    def save(
+        self,
+        namespace: str,
+        name: str,
+        archive_bytes: bytes,
+        metadata: Dict[str, Any],
+        scan_report_json: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """POST /v1/skills/@{ns}/{name} — save a skill version (multipart)."""
+        fields = [
+            ("archive", f"{name}.tar.gz", archive_bytes, "application/gzip"),
+            ("metadata", "", json.dumps(metadata).encode("utf-8"), "application/json"),
+        ]
+        if scan_report_json:
+            fields.insert(1, ("scan_report", "", scan_report_json.encode("utf-8"), "application/json"))
+        body, ct = self._build_multipart(fields)
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        resp = self._request("POST", f"/v1/skills/@{ns}/{nm}", body=body, content_type=ct)
+        return resp.get("data", resp)
+
+    def negotiate(
+        self,
+        namespace: str,
+        name: str,
+        version: str,
+        file_manifest: list[dict],
+    ) -> dict:
+        """POST /v1/skills/@{ns}/{name}/negotiate -- determine which files need uploading."""
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        payload = {
+            "version": version,
+            "file_manifest": file_manifest,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        resp = self._request(
+            "POST",
+            f"/v1/skills/@{ns}/{nm}/negotiate",
+            body=body,
+            content_type="application/json",
+        )
+        return resp.get("data", resp)
+
+    def save_v2(
+        self,
+        namespace: str,
+        name: str,
+        metadata: Dict[str, Any],
+        file_manifest: list[dict],
+        needed_files: list[str],
+        skill_path: Path,
+        scan_report_json: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """POST /v1/skills/@{ns}/{name} -- save using v2 file upload protocol.
+
+        Sends file_manifest in the metadata JSON and only uploads files
+        whose paths appear in needed_files.
+        """
+        # Build metadata with file_manifest included
+        meta = dict(metadata)
+        meta["file_manifest"] = file_manifest
+
+        fields: List[Tuple[str, str, bytes, str]] = [
+            ("metadata", "", json.dumps(meta).encode("utf-8"), "application/json"),
+        ]
+
+        if scan_report_json:
+            fields.append(("scan_report", "", scan_report_json.encode("utf-8"), "application/json"))
+
+        # Add file fields for needed files only — validate against local manifest
+        # to prevent a compromised server from exfiltrating arbitrary files
+        manifest_paths = {f["path"] for f in file_manifest}
+        skill_path = Path(skill_path).resolve()
+        for i, rel_path in enumerate(needed_files):
+            if rel_path not in manifest_paths:
+                raise SkillSafeError(
+                    "invalid_needed_file",
+                    f"Server requested file not in local manifest: {rel_path!r}",
+                )
+            file_path = skill_path / rel_path
+            # Guard: resolved path must stay inside skill_path
+            resolved = file_path.resolve()
+            if not str(resolved).startswith(str(skill_path) + os.sep) and resolved != skill_path:
+                raise SkillSafeError(
+                    "path_traversal",
+                    f"Requested file escapes skill directory: {rel_path!r}",
+                )
+            content = file_path.read_bytes()
+            # The filename carries the relative path (server reads it from value.name)
+            fields.append((f"file_{i}", rel_path, content, "application/octet-stream"))
+
+        body, ct = self._build_multipart(fields)
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        resp = self._request("POST", f"/v1/skills/@{ns}/{nm}", body=body, content_type=ct)
+        return resp.get("data", resp)
+
+    def share(
+        self,
+        namespace: str,
+        name: str,
+        version: str,
+        visibility: str = "private",
+        expires_in: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """POST /v1/skills/@{ns}/{name}/versions/{ver}/share — create a share link."""
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        ver = self._encode_path_segment(version)
+        payload: Dict[str, Any] = {"visibility": visibility}
+        if expires_in:
+            payload["expires_in"] = expires_in
+        body = json.dumps(payload).encode("utf-8")
+        resp = self._request(
+            "POST",
+            f"/v1/skills/@{ns}/{nm}/versions/{ver}/share",
+            body=body,
+            content_type="application/json",
+        )
+        return resp.get("data", resp)
+
+    def yank(self, namespace: str, name: str, version: str, reason: str = "") -> Dict[str, Any]:
+        """POST /v1/skills/@{ns}/{name}/versions/{version}/yank — yank a version."""
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        ver = self._encode_path_segment(version)
+        body = json.dumps({"reason": reason}).encode("utf-8")
+        resp = self._request(
+            "POST",
+            f"/v1/skills/@{ns}/{nm}/versions/{ver}/yank",
+            body=body,
+            content_type="application/json",
+        )
+        return resp.get("data", resp)
+
+    def upload_demo(self, namespace: str, name: str, version: str, demo_json: Any, title: str = "") -> Dict[str, Any]:
+        """POST /v1/skills/@{ns}/{name}/versions/{version}/demos — upload a demo recording."""
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        ver = self._encode_path_segment(version)
+        payload: Dict[str, Any] = {"demo": demo_json}
+        if title:
+            payload["title"] = title
+        body = json.dumps(payload).encode("utf-8")
+        resp = self._request(
+            "POST",
+            f"/v1/skills/@{ns}/{nm}/versions/{ver}/demos",
+            body=body,
+            content_type="application/json",
+        )
+        return resp.get("data", resp)
+
+    def download_via_share(self, share_id: str):
+        """
+        GET /v1/share/{share_id}/download — download via share link.
+
+        Returns (format, data) tuple:
+          - v2 (JSON manifest): ("files", manifest_dict)
+          - v1 (archive):       ("archive", (archive_bytes, tree_hash, version))
+
+        Note: Tree hash / manifest integrity data is bundled in the same response
+        as the payload. This guards against corruption but not against a MITM that
+        can modify both in lockstep.
+        """
+        _validate_share_id(share_id)
+        data, headers = self._request(
+            "GET", f"/v1/share/{share_id}/download", raw_response=True, auth=False
+        )
+        ct = headers.get("Content-Type", "")
+        if "application/json" in ct:
+            manifest = json.loads(data.decode("utf-8"))
+            return ("files", manifest.get("data", manifest))
+        tree_hash = headers.get("X-SkillSafe-Tree-Hash", "")
+        version = headers.get("X-SkillSafe-Version", "")
+        return ("archive", (data, tree_hash, version))
+
+    def download(self, namespace: str, name: str, version: str):
+        """
+        GET /v1/skills/@{ns}/{name}/download/{version} — download a skill version.
+
+        Returns (format, data) tuple:
+          - v2 (JSON manifest): ("files", manifest_dict)
+          - v1 (archive):       ("archive", (archive_bytes, tree_hash))
+
+        Note: For v1 archives, the tree hash is delivered in the same HTTP response
+        as the data (X-SkillSafe-Tree-Hash header). This protects against accidental
+        corruption but not against a MITM that can modify both in lockstep.
+        """
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        ver = self._encode_path_segment(version)
+        data, headers = self._request(
+            "GET", f"/v1/skills/@{ns}/{nm}/download/{ver}", raw_response=True
+        )
+        ct = headers.get("Content-Type", "")
+        if "application/json" in ct:
+            manifest = json.loads(data.decode("utf-8"))
+            return ("files", manifest.get("data", manifest))
+        tree_hash = headers.get("X-SkillSafe-Tree-Hash", "")
+        return ("archive", (data, tree_hash))
+
+    def verify(
+        self, namespace: str, name: str, version: str, scan_report: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """POST /v1/skills/@{ns}/{name}/versions/{version}/verify — submit verification."""
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        ver = self._encode_path_segment(version)
+        body = json.dumps({"scan_report": scan_report}).encode("utf-8")
+        resp = self._request(
+            "POST",
+            f"/v1/skills/@{ns}/{nm}/versions/{ver}/verify",
+            body=body,
+            content_type="application/json",
+        )
+        return resp.get("data", resp)
+
+    def search(
+        self,
+        query: Optional[str] = None,
+        category: Optional[str] = None,
+        sort: str = "popular",
+        limit: int = 20,
+        cursor: Optional[str] = None,
+        page: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """GET /v1/skills/search — search the registry."""
+        params: Dict[str, str] = {"sort": sort, "limit": str(limit)}
+        if query:
+            params["q"] = query
+        if category:
+            params["category"] = category
+        if cursor:
+            params["cursor"] = cursor
+        if page is not None:
+            params["page"] = str(page)
+        qs = urllib.parse.urlencode(params)
+        resp = self._request("GET", f"/v1/skills/search?{qs}", auth=False)
+        return resp
+
+    def get_metadata(self, namespace: str, name: str, auth: bool = False) -> Dict[str, Any]:
+        """GET /v1/skills/@{ns}/{name} — skill metadata."""
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        resp = self._request("GET", f"/v1/skills/@{ns}/{nm}", auth=auth)
+        return resp.get("data", resp)
+
+    def resolve_next_version(self, namespace: str, name: str) -> str:
+        """Resolve the next patch version for a skill, or 0.1.0 if it doesn't exist."""
+        try:
+            meta = self.get_metadata(namespace, name, auth=True)
+            latest = meta.get("latest_version")
+            if not latest:
+                return "0.1.0"
+            # Parse major.minor.patch and increment patch
+            m = re.match(r'^(\d+)\.(\d+)\.(\d+)', latest)
+            if not m:
+                return "0.1.0"
+            major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            return f"{major}.{minor}.{patch + 1}"
+        except SkillSafeError:
+            return "0.1.0"
+
+    def get_versions(self, namespace: str, name: str, limit: int = 20, auth: bool = False) -> Dict[str, Any]:
+        """GET /v1/skills/@{ns}/{name}/versions — version list."""
+        ns = self._encode_path_segment(namespace)
+        nm = self._encode_path_segment(name)
+        resp = self._request("GET", f"/v1/skills/@{ns}/{nm}/versions?limit={limit}", auth=auth)
+        return resp
+
+    def download_blob(self, blob_hash: str) -> bytes:
+        """GET /v1/blobs/{hash} — download an individual blob by content-hash."""
+        _validate_blob_hash(blob_hash)
+        data, headers = self._request(
+            "GET", f"/v1/blobs/{blob_hash}", raw_response=True, auth=False
+        )
+        return data
+
+    def get_account(self) -> Dict[str, Any]:
+        """GET /v1/account — retrieve own account details (requires auth)."""
+        resp = self._request("GET", "/v1/account")
+        return resp.get("data", resp)
+
+
+# ---------------------------------------------------------------------------
+# V2 manifest-based install
+# ---------------------------------------------------------------------------
+
+
+def _validate_manifest_path(rel_path: str, dest_dir: Path) -> Path:
+    """Validate a manifest file path against traversal and symlink attacks.
+
+    Raises SkillSafeError if the path is unsafe (GAP-4.4, GAP-4.5).
+    Returns the resolved absolute path within dest_dir.
+    """
+    # Reject path traversal components, absolute paths, and backslashes
+    if ".." in rel_path.split("/") or rel_path.startswith("/") or "\\" in rel_path:
+        raise SkillSafeError(
+            "security_error",
+            f"Refusing to install file with unsafe path: '{rel_path}'"
+        )
+
+    # Resolve and verify the path stays inside dest_dir
+    resolved_dest = os.path.realpath(dest_dir)
+    resolved_file = os.path.realpath(os.path.join(resolved_dest, rel_path))
+    if not resolved_file.startswith(resolved_dest + os.sep) and resolved_file != resolved_dest:
+        raise SkillSafeError(
+            "security_error",
+            f"Path traversal detected: '{rel_path}' resolves outside destination"
+        )
+
+    return Path(resolved_file)
+
+
+def install_from_manifest(
+    client: SkillSafeClient,
+    manifest: dict,
+    dest_dir: Path,
+    verbose: bool = False,
+    install_timeout: float = 600,  # 10 minutes cumulative timeout
+) -> Tuple[str, int, int]:
+    """Download files from a v2 manifest and reconstruct the skill directory.
+
+    Returns (tree_hash, cached_count, downloaded_count).
+    """
+    install_start = time.monotonic()
+
+    # Validate manifest structure
+    if not isinstance(manifest, dict) or "files" not in manifest or "tree_hash" not in manifest:
+        raise SkillSafeError("invalid_manifest", "Server returned incomplete manifest (missing 'files' or 'tree_hash')")
+    files = manifest["files"]
+    tree_hash = manifest["tree_hash"]
+    cached_count = 0
+    downloaded_count = 0
+    max_retries = 3
+
+    # Step 0: Validate all paths and blob hashes before downloading anything (GAP-4.4)
+    dest_dir_resolved = Path(os.path.realpath(dest_dir))
+    for f in files:
+        if not isinstance(f, dict) or "path" not in f or "hash" not in f or "size" not in f:
+            raise SkillSafeError("invalid_manifest", "Manifest file entry missing required fields (path, hash, size)")
+        _validate_manifest_path(f["path"], dest_dir_resolved)
+        _validate_blob_hash(f["hash"])
+
+    # Step 1: Download or fetch from cache each blob
+    downloaded_files: List[Dict[str, Any]] = []
+    for f in files:
+        blob_hash = f["hash"]
+        blob_path = f["path"]
+        blob_size = f["size"]
+
+        # Try local cache first
+        data = get_cached_blob(blob_hash)
+        if data is not None:
+            cached_count += 1
+            if verbose:
+                print(f"    Cache hit: {blob_path}")
+        else:
+            # Download from server with retry (GAP-4.8)
+            downloaded_count += 1
+            if verbose:
+                print(f"    Downloading: {blob_path} ({blob_size} bytes)")
+            last_err: Optional[Exception] = None
+            max_blob_retries = max_retries
+            attempt = 0
+            while attempt < max_blob_retries:
+                try:
+                    data = client.download_blob(blob_hash)
+                    last_err = None
+                    break
+                except SkillSafeError as e:
+                    last_err = e
+                    if attempt < max_blob_retries - 1:
+                        # GAP-7.3: respect Retry-After for 429 rate limit responses
+                        if e.status == 429 and e.retry_after:
+                            wait = e.retry_after
+                            # Allow extra retries for rate limits (up to 6 total)
+                            max_blob_retries = max(max_blob_retries, 6)
+                        else:
+                            wait = 2 ** attempt  # 1s, 2s
+                        if verbose:
+                            print(f"    Retry {attempt + 1}/{max_blob_retries - 1} after {wait}s"
+                                  f"{' (rate limited)' if e.status == 429 else ''}...")
+                        # Guard: cumulative timeout prevents server-driven DoS via repeated 429s
+                        if time.monotonic() - install_start > install_timeout:
+                            raise SkillSafeError(
+                                "install_timeout",
+                                f"Install timed out after {install_timeout:.0f}s due to repeated retries"
+                            )
+                        time.sleep(wait)
+                attempt += 1
+            if last_err is not None:
+                raise last_err
+
+            # Per-blob size and SHA-256 verification
+            if len(data) != blob_size:
+                raise SkillSafeError(
+                    "integrity_error",
+                    f"Blob size mismatch for '{blob_path}': "
+                    f"expected {blob_size} bytes, got {len(data)} bytes"
+                )
+            actual_hash = "sha256:" + hashlib.sha256(data).hexdigest()
+            if actual_hash != blob_hash:
+                raise SkillSafeError(
+                    "integrity_error",
+                    f"Blob hash mismatch for '{blob_path}': "
+                    f"expected {blob_hash}, got {actual_hash}"
+                )
+
+            # Cache the verified blob
+            cache_blob(blob_hash, data)
+
+        downloaded_files.append({"path": blob_path, "hash": blob_hash, "data": data})
+
+    # Step 2: Verify tree hash
+    file_manifest_for_hash = [{"path": f["path"], "hash": f["hash"]} for f in files]
+    computed_tree_hash = compute_tree_hash_v2(file_manifest_for_hash)
+    if computed_tree_hash != tree_hash:
+        raise SkillSafeError(
+            "integrity_error",
+            f"Tree hash mismatch: server={tree_hash}, computed={computed_tree_hash}"
+        )
+
+    # Step 3: Clean stale files from dest_dir (GAP-4.7)
+    # Remove files that exist in dest_dir but are not in the new manifest,
+    # so upgrades don't leave orphaned files from previous versions.
+    manifest_paths = {f["path"] for f in downloaded_files}
+    if dest_dir.exists():
+        for existing_file in list(dest_dir.rglob("*")):
+            if existing_file.is_file() or existing_file.is_symlink():
+                try:
+                    rel = existing_file.relative_to(dest_dir)
+                    rel_posix = rel.as_posix()
+                    if rel_posix not in manifest_paths:
+                        existing_file.unlink()
+                        if verbose:
+                            print(f"    Removed stale file: {rel_posix}")
+                except ValueError:
+                    pass  # Not relative to dest_dir, skip
+
+    # Step 4: Write files to dest_dir
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(dest_dir, 0o700)
+    except OSError:
+        pass  # Best-effort: may fail on some filesystems
+    for f in downloaded_files:
+        file_path = dest_dir / f["path"]
+
+        # GAP-4.5: Remove existing symlinks at destination to prevent
+        # following a symlink that writes outside dest_dir
+        if file_path.is_symlink():
+            file_path.unlink()
+
+        # Also check parent directories for symlinks escaping dest_dir
+        parent = file_path.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        resolved_parent = Path(os.path.realpath(parent))
+        if not str(resolved_parent).startswith(str(dest_dir_resolved) + os.sep) and resolved_parent != dest_dir_resolved:
+            raise SkillSafeError(
+                "security_error",
+                f"Symlink in parent path escapes destination for '{f['path']}'"
+            )
+
+        file_path.write_bytes(f["data"])
+
+    # Step 5: Clean up empty directories left after stale file removal
+    if dest_dir.exists():
+        for dirpath in sorted(dest_dir.rglob("*"), reverse=True):
+            if dirpath.is_dir() and not any(dirpath.iterdir()):
+                dirpath.rmdir()
+
+    return computed_tree_hash, cached_count, downloaded_count
+
+
+# ---------------------------------------------------------------------------
+# CLI Commands
+# ---------------------------------------------------------------------------
+
+
+def parse_skill_ref(ref: str) -> Tuple[str, str]:
+    """
+    Parse '@namespace/skill-name' into (namespace, name).
+
+    Accepts with or without the leading '@'.
+    Namespace and name must contain only alphanumeric characters (case-insensitive),
+    hyphens, underscores, and dots.
+    """
+    ref = ref.lstrip("@")
+    if "/" not in ref:
+        raise SkillSafeError("invalid_reference", f"Invalid skill reference '{ref}'. Expected format: @namespace/skill-name")
+    parts = ref.split("/", 1)
+    namespace, name = parts[0], parts[1]
+    if not namespace or not name:
+        raise SkillSafeError("invalid_reference", "Invalid skill reference: namespace and name must not be empty")
+    # Validate characters to prevent path traversal and other injection
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,38}$', namespace):
+        raise SkillSafeError("invalid_reference", f"Invalid namespace '{namespace}'. Use alphanumeric characters, hyphens, and underscores (1-39 chars).")
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,100}$', name):
+        raise SkillSafeError("invalid_reference", f"Invalid skill name '{name}'. Use alphanumeric characters, dots, hyphens, and underscores (1-101 chars).")
+    return namespace, name
+
+
+def _validate_skill_name(name: str) -> None:
+    """Validate a skill name derived from a directory name or --name flag.
+
+    Uses the same regex as parse_skill_ref to ensure consistency.
+    Prints an error and exits if the name is invalid.
+    """
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,100}$', name):
+        print(f"Error: Invalid skill name '{name}'. Use alphanumeric characters, dots, hyphens, and underscores (1-101 chars, must start with alphanumeric).", file=sys.stderr)
+        sys.exit(1)
+
+
+def _validate_saved_key(api_base: str) -> bool:
+    """
+    Check if a saved API key exists and is still valid.
+
+    Returns True if the saved key is valid (auth not needed), False otherwise.
+    """
+    cfg = load_config()
+    api_key = cfg.get("api_key")
+    if not api_key:
+        return False
+
+    saved_base = cfg.get("api_base", DEFAULT_API_BASE)
+    if saved_base != api_base:
+        return False  # different server, need fresh auth
+    client = SkillSafeClient(api_base=api_base, api_key=api_key)
+
+    try:
+        account = client.get_account()
+    except SkillSafeError:
+        return False
+    except Exception:
+        return False
+
+    # Key is valid — update config with latest account info in case it changed
+    cfg["account_id"] = account.get("account_id", cfg.get("account_id", ""))
+    cfg["username"] = account.get("username", cfg.get("username", ""))
+    cfg["namespace"] = f"@{account.get('username', '')}" if account.get("username") else cfg.get("namespace", "")
+    save_config(cfg)
+
+    print(green("Already authenticated."))
+    print(f"  Account:   {cfg['account_id']}")
+    print(f"  Username:  {cfg['username']}")
+    print(f"  Namespace: {cfg['namespace']}")
+    print(f"  API key:   {dim(_mask_api_key(api_key))}")
+    print(f"  Config:    {CONFIG_FILE}")
+    print(f"\n  To re-authenticate, delete {CONFIG_FILE} and run auth again.")
+    return True
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    """Interactive wizard to initialize a skillsafe.yaml manifest in a skill directory."""
+    import readline  # noqa: F401 — enables better input() UX where available
+
+    target = Path(getattr(args, "path", None) or ".").resolve()
+    if not target.is_dir():
+        print(f"Error: {target} is not a directory.", file=sys.stderr)
+        sys.exit(1)
+
+    yaml_path = target / "skillsafe.yaml"
+    if yaml_path.exists():
+        print(f"  {bold('skillsafe.yaml')} already exists in {target}")
+        ans = input("  Overwrite? [y/N] ").strip().lower()
+        if ans != "y":
+            print("  Aborted.")
+            return
+
+    print(f"\n{bold('SkillSafe Init')} — initializing skill in {target}\n")
+
+    # Skill name
+    default_name = target.name
+    raw_name = input(f"  Skill name [{default_name}]: ").strip()
+    skill_name = raw_name if raw_name else default_name
+
+    # Namespace (publisher)
+    cfg = load_config()
+    default_ns = cfg.get("username", "")
+    raw_ns = input(f"  Publisher namespace [{default_ns or 'your-username'}]: ").strip()
+    namespace = raw_ns if raw_ns else default_ns
+
+    # Version
+    raw_ver = input("  Initial version [1.0.0]: ").strip()
+    version = raw_ver if raw_ver else "1.0.0"
+    semver_re = r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$'
+    if not re.match(semver_re, version):
+        print(f"  Warning: '{version}' is not a valid semver. Using 1.0.0 instead.")
+        version = "1.0.0"
+
+    # Description
+    description = input("  Description: ").strip()
+
+    # Category
+    categories = ["code-quality", "code-review", "data-analysis", "database", "deployment",
+                  "docs", "frontend", "infra", "performance", "security", "testing", "utility", "other"]
+    print(f"  Category options: {', '.join(categories)}")
+    raw_cat = input("  Category [utility]: ").strip().lower()
+    category = raw_cat if raw_cat in categories else "utility"
+
+    # Tags
+    raw_tags = input("  Tags (comma-separated, optional): ").strip()
+    tags = [t.strip() for t in raw_tags.split(",") if t.strip()] if raw_tags else []
+
+    # Entrypoint
+    md_candidates = ["skill.md", "SKILL.md", "README.md"]
+    default_entry = next((f for f in md_candidates if (target / f).exists()), "skill.md")
+    raw_entry = input(f"  Entrypoint file [{default_entry}]: ").strip()
+    entrypoint = raw_entry if raw_entry else default_entry
+
+    # Build YAML content (hand-written to avoid yaml dependency)
+    ns_str = f"@{namespace}/{skill_name}" if namespace else skill_name
+    tags_yaml = ("\n" + "\n".join(f"  - \"{t}\"" for t in tags)) if tags else " []"
+
+    safe_desc = description.replace('"', '\\"')
+    yaml_content = (
+        '# SkillSafe manifest — generated by `skillsafe init`\n'
+        '# See https://docs.skillsafe.ai/manifest for full spec\n\n'
+        f'name: "{ns_str}"\n'
+        f'version: "{version}"\n'
+        f'description: "{safe_desc}"\n'
+        f'entrypoint: "{entrypoint}"\n'
+        f'category: "{category}"\n'
+        f'tags:{tags_yaml}\n'
+    )
+
+    yaml_path.write_text(yaml_content)
+
+    # Also write .skillsafe.json for backwards compat with current save command
+    json_meta = {"name": skill_name}
+    if namespace:
+        json_meta["namespace"] = f"@{namespace}"
+    json_path = target / ".skillsafe.json"
+    json_path.write_text(json.dumps(json_meta, indent=2) + "\n")
+
+    print(f"\n  {green('✓')} Created {bold('skillsafe.yaml')}")
+    print(f"  {green('✓')} Created {bold('.skillsafe.json')} (for save command compatibility)\n")
+    print(f"  {bold('Next steps:')}")
+    print(f"    1. {bold('skillsafe auth')}           — sign in (first time only)")
+    print(f"    2. {bold(f'skillsafe save {target} --version {version}')}  — save privately")
+    print(f"    3. {bold(f'skillsafe share @{namespace}/{skill_name} --version {version}')}  — share (scan required)")
+    print()
+
+
+def cmd_lint(args: argparse.Namespace) -> None:
+    """Validate a skillsafe.yaml manifest and report issues."""
+    target = Path(getattr(args, "path", None) or ".").resolve()
+    if not target.is_dir():
+        print(f"Error: {target} is not a directory.", file=sys.stderr)
+        sys.exit(1)
+
+    yaml_path = target / "skillsafe.yaml"
+    if not yaml_path.exists():
+        print(f"  {red('✗')} No {bold('skillsafe.yaml')} found in {target}")
+        print(f"    Run {bold('skillsafe init')} to create one.")
+        sys.exit(1)
+
+    print(f"\n{bold('SkillSafe Lint')} — validating {yaml_path}\n")
+
+    # Parse YAML without a library using simple key: value line parsing
+    manifest: Dict[str, Any] = {}
+    try:
+        text = yaml_path.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if ":" in stripped:
+                key, _, value = stripped.partition(":")
+                key = key.strip().strip('"').strip("'")
+                value = value.strip().strip('"').strip("'")
+                if value:  # only store scalar values (ignore list items)
+                    manifest[key] = value
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"  {red('✗')} Could not read skillsafe.yaml: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    errors: list = []
+    warnings: list = []
+    passed: list = []
+
+    # --- Required fields ---
+    semver_re = r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$'
+    name_val = manifest.get("name", "")
+    version_val = manifest.get("version", "")
+    entrypoint_val = manifest.get("entrypoint", "")
+    description_val = manifest.get("description", "")
+
+    if not name_val:
+        errors.append("'name' is required")
+    else:
+        passed.append(f"name: {name_val}")
+
+    if not version_val:
+        errors.append("'version' is required")
+    elif not re.match(semver_re, version_val):
+        errors.append(f"'version' must be valid semver (e.g. 1.0.0), got: {version_val!r}")
+    else:
+        passed.append(f"version: {version_val} (valid semver)")
+
+    if not entrypoint_val:
+        errors.append("'entrypoint' is required (e.g. skill.md)")
+    else:
+        entry_path = target / entrypoint_val
+        if not entry_path.exists():
+            errors.append(f"'entrypoint' file not found: {entrypoint_val} (expected at {entry_path})")
+        else:
+            passed.append(f"entrypoint: {entrypoint_val} (exists)")
+
+    if not description_val:
+        warnings.append("'description' is missing — add one to improve discoverability")
+    elif len(description_val) < 10:
+        warnings.append(f"'description' is very short ({len(description_val)} chars) — a longer description helps users find your skill")
+    else:
+        passed.append(f"description: {description_val[:60]}{'...' if len(description_val) > 60 else ''}")
+
+    # --- Category ---
+    valid_categories = {
+        "code-quality", "code-review", "data-analysis", "database", "deployment",
+        "docs", "frontend", "infra", "performance", "security", "testing", "utility", "other",
+    }
+    category_val = manifest.get("category", "")
+    if category_val and category_val not in valid_categories:
+        warnings.append(f"'category' {category_val!r} is not in the standard list. Valid: {', '.join(sorted(valid_categories))}")
+    elif category_val:
+        passed.append(f"category: {category_val}")
+
+    # --- Tags ---
+    tags_val = manifest.get("tags", "")
+    if tags_val and tags_val not in ("[", "]", "[]", ""):
+        # Inline tags like: tags: code-review,typescript
+        raw_tags = [t.strip().strip('"').strip("'").lstrip("- ") for t in tags_val.replace(",", " ").split()]
+        bad_tags = [t for t in raw_tags if t and (t != t.lower() or " " in t)]
+        if bad_tags:
+            warnings.append(f"Tags should be lowercase with no spaces. Problematic: {bad_tags}")
+        elif raw_tags:
+            passed.append(f"tags: {', '.join(raw_tags[:5])}")
+
+    # --- evals (if present) ---
+    pass_rate_val = manifest.get("pass_rate", "")
+    if pass_rate_val:
+        try:
+            pr = float(pass_rate_val)
+            if pr < 0 or pr > 100:
+                errors.append(f"'evals.pass_rate' must be between 0 and 100, got: {pr}")
+            elif pr < 80:
+                warnings.append(f"'evals.pass_rate' is {pr}% — skills need ≥80% to reach 'Tested' tier")
+            else:
+                passed.append(f"evals.pass_rate: {pr}%")
+        except ValueError:
+            errors.append(f"'evals.pass_rate' must be a number, got: {pass_rate_val!r}")
+
+    # --- Print results ---
+    for p in passed:
+        print(f"  {green('✓')} {p}")
+
+    for w in warnings:
+        print(f"  {yellow('⚠')} {w}")
+
+    for e in errors:
+        print(f"  {red('✗')} {e}")
+
+    print()
+    if errors:
+        print(f"  {red(bold(f'{len(errors)} error(s)'))}, {len(warnings)} warning(s) — fix errors before saving")
+        sys.exit(1)
+    elif warnings:
+        print(f"  {green('Manifest is valid')} ({len(warnings)} warning(s))")
+    else:
+        print(f"  {green(bold('Manifest is valid ✓'))}")
+
+
+def cmd_whoami(args: argparse.Namespace) -> None:
+    """Show current authentication status and account info."""
+    cfg = load_config()
+    api_key = cfg.get("api_key")
+
+    if not api_key:
+        print(red("Not authenticated."))
+        print(f"\n  Run {bold('skillsafe auth')} to get started.")
+        sys.exit(1)
+
+    # Show local config info
+    print(f"\n  {bold('Local config')}")
+    print(f"  Username:    {cfg.get('username', dim('unknown'))}")
+    print(f"  Namespace:   {cfg.get('namespace', dim('unknown'))}")
+    print(f"  API key:     {dim(_mask_api_key(api_key))}")
+    print(f"  API base:    {cfg.get('api_base', DEFAULT_API_BASE)}")
+    print(f"  Config file: {CONFIG_FILE}")
+
+    # Verify against server
+    api_base = cfg.get("api_base", DEFAULT_API_BASE)
+    client = SkillSafeClient(api_base=api_base, api_key=api_key)
+
+    try:
+        account = client.get_account()
+    except SkillSafeError as e:
+        if e.status == 401:
+            print(f"\n  {red('Session expired.')} Run {bold('skillsafe auth')} to sign in again.")
+            sys.exit(1)
+        print(f"\n  {yellow('Could not verify account:')} {e.message}")
+        sys.exit(1)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"\n  {yellow('Could not connect to API.')} {e}")
+        print(f"  Local config appears valid. Use {bold('--api-base')} to change the server.")
+        sys.exit(1)
+
+    # Show verified account details
+    print(f"\n  {bold('Account')} {green('(verified)')}")
+    print(f"  Email:       {account.get('email') or dim('not set')}")
+
+    email_verified = account.get("email_verified", False)
+    if email_verified:
+        print(f"  Verified:    {green('yes')}")
+    else:
+        print(f"  Verified:    {yellow('no')}")
+
+    print(f"  Tier:        {account.get('tier', 'free')}")
+
+    # Storage usage
+    used = account.get("storage_used_bytes", 0)
+    used_mb = used / (1024 * 1024)
+    print(f"  Storage:     {used_mb:.1f} MB used")
+
+    print(f"  Skills:      {account.get('shared_skill_count', 0)} shared")
+    print(f"  Member since: {(account.get('created_at') or '-')[:10]}")
+    print()
+
+
+def cmd_update(args: argparse.Namespace) -> None:
+    """Unified update: self-update the CLI or upgrade installed skills."""
+    skill_ref: Optional[str] = getattr(args, "skill", None)
+    fetch_all: bool = getattr(args, "all", False)
+
+    # self-update: no skill arg, or explicit "skillsafe"
+    if args.command == "self-update" or (not fetch_all and (not skill_ref or skill_ref.strip("@") == "skillsafe")):
+        cmd_self_update(args)
+        return
+
+    # Otherwise: upgrade one skill or all installed skills
+    cmd_upgrade(args)
+
+
+def cmd_upgrade(args: argparse.Namespace) -> None:
+    """Check all installed skills for newer registry versions and reinstall outdated ones."""
+    cfg = load_config()
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg.get("api_key", ""))
+
+    skill_ref: Optional[str] = getattr(args, "skill", None)
+    tool_filter: Optional[str] = getattr(args, "tool", None)
+    dry_run: bool = getattr(args, "dry_run", False)
+
+    # Collect all candidate skill directories to check
+    candidates: List[Tuple[str, str, str, Path]] = []  # (namespace, name, installed_version, skill_dir)
+
+    def _collect_from_dir(base_dir: Path) -> None:
+        if not base_dir.is_dir():
+            return
+        for skill_dir in sorted(base_dir.iterdir()):
+            if not skill_dir.is_dir():
+                continue
+            meta_path = skill_dir / ".skillsafe.json"
+            if not meta_path.exists():
+                continue
+            try:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                ns = (meta.get("namespace") or meta.get("ns", "")).lstrip("@")
+                nm = meta.get("name", "")
+                ver = meta.get("version", "")
+                if ns and nm and ver:
+                    candidates.append((ns, nm, ver, skill_dir))
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    if tool_filter:
+        _collect_from_dir(TOOL_SKILLS_DIRS[tool_filter])
+    else:
+        for tool_dir in TOOL_SKILLS_DIRS.values():
+            _collect_from_dir(tool_dir)
+
+    if not candidates:
+        print("No installed skills with registry metadata found.")
+        print("Tip: only skills installed via 'skillsafe install' can be upgraded.")
+        return
+
+    # Filter to a specific skill if requested
+    if skill_ref:
+        ns_filter, nm_filter = parse_skill_ref(skill_ref)
+        candidates = [(ns, nm, ver, d) for ns, nm, ver, d in candidates
+                      if ns == ns_filter and nm == nm_filter]
+        if not candidates:
+            print(f"Skill {bold(skill_ref)} is not installed or has no registry metadata.")
+            sys.exit(1)
+
+    print(f"Checking {len(candidates)} installed skill(s) for updates...\n")
+    print(f"  {'SKILL':<35} {'INSTALLED':<12} {'LATEST':<12} STATUS")
+    print(f"  {'─' * 35} {'─' * 12} {'─' * 12} {'─' * 10}")
+
+    to_upgrade: List[Tuple[str, str, str, Path]] = []  # (ns, nm, latest_ver, skill_dir)
+
+    for ns, nm, installed_ver, skill_dir in candidates:
+        ref = f"@{ns}/{nm}"
+        try:
+            meta = client.get_metadata(ns, nm)
+            latest_ver = meta.get("latest_version", "")
+            if not latest_ver:
+                print(f"  {ref:<35} {installed_ver:<12} {'?':<12} unknown")
+                continue
+            if _parse_semver(latest_ver) > _parse_semver(installed_ver):
+                print(f"  {ref:<35} {installed_ver:<12} {latest_ver:<12} {yellow('outdated')}")
+                to_upgrade.append((ns, nm, latest_ver, skill_dir))
+            else:
+                print(f"  {ref:<35} {installed_ver:<12} {latest_ver:<12} {green('up to date')}")
+        except SkillSafeError:
+            print(f"  {ref:<35} {installed_ver:<12} {'?':<12} not found in registry")
+        except (urllib.error.URLError, OSError):
+            print(f"  {ref:<35} {installed_ver:<12} {'?':<12} network error")
+
+    if not to_upgrade:
+        print(f"\n{green('All skills are up to date.')}")
+        return
+
+    print(f"\n{len(to_upgrade)} skill(s) can be upgraded.")
+
+    if dry_run:
+        print("(dry run — pass without --dry-run to apply upgrades)")
+        return
+
+    print()
+    upgraded = 0
+    for ns, nm, latest_ver, skill_dir in to_upgrade:
+        ref = f"@{ns}/{nm}"
+        print(f"Upgrading {bold(ref)} → v{latest_ver}...")
+        # Determine install path (parent of skill_dir)
+        install_parent = skill_dir.parent
+
+        # Build a minimal args namespace to reuse cmd_install logic
+        import types
+        fake_args = types.SimpleNamespace(
+            skill=f"@{ns}/{nm}",
+            version=latest_ver,
+            tool=None,
+            location="global",
+            skills_dir=str(install_parent),
+        )
+        try:
+            cmd_install(fake_args)
+            upgraded += 1
+        except SystemExit:
+            print(f"  {red('Failed')} to upgrade {ref}.")
+
+    print(f"\n{green(f'Upgraded {upgraded}/{len(to_upgrade)} skill(s).')}")
+
+
+def cmd_self_update(args: argparse.Namespace) -> None:
+    """Download the latest skillsafe.py from skillsafe.ai and replace this script."""
+    url = "https://skillsafe.ai/scripts/skillsafe.py"
+    script_path = Path(__file__).resolve()
+
+    print(f"  Current version: {bold(f'v{VERSION}')}")
+    print(f"  Checking {url} ...")
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": f"skillsafe-cli/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            new_src = resp.read()
+    except Exception as e:
+        print(f"\n{red('Error:')} Could not download update: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Extract version from downloaded script
+    m = re.search(rb'^VERSION\s*=\s*["\']([^"\']+)["\']', new_src, re.MULTILINE)
+    new_version = m.group(1).decode() if m else "unknown"
+
+    if new_version != "unknown" and _parse_semver(new_version) <= _parse_semver(VERSION):
+        print(f"\n{green('Already up to date.')} (v{VERSION})")
+        return
+
+    # Write atomically via temp file
+    tmp = script_path.with_suffix(".py.tmp")
+    try:
+        tmp.write_bytes(new_src)
+        tmp.replace(script_path)
+    except OSError as e:
+        print(f"\n{red('Error:')} Could not write update: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\n{green(f'Updated: v{VERSION} → v{new_version}')}")
+    print(f"  {script_path}")
+
+
+def cmd_auth(args: argparse.Namespace) -> None:
+    """Authenticate via browser login."""
+    api_base: str = getattr(args, "api_base", DEFAULT_API_BASE)
+
+    # Check if a saved key is already valid
+    if _validate_saved_key(api_base):
+        return
+
+    # Saved key missing or invalid — start browser-based login flow
+    _auth_browser(api_base)
+
+
+def _detect_tool() -> str:
+    """Detect which AI coding tool is invoking the CLI based on script path.
+
+    Works with any tool that follows the ``~/.<tool>/skills/`` convention,
+    not just the ones listed in TOOL_SKILLS_DIRS.  For example a script
+    installed at ``~/.copilot/skills/skillsafe/scripts/skillsafe.py``
+    will return ``"copilot"``.
+
+    Codex installs skills under ``~/.agents/skills/`` (no tool prefix in the
+    directory name), so the detected folder name ``"agents"`` is mapped to
+    ``"codex"`` via the alias table below.
+    """
+    # Map raw folder names to canonical tool keys when they differ.
+    _dir_aliases = {"agents": "codex"}
+    try:
+        script_path = Path(__file__).resolve()
+        home = Path.home().resolve()
+        rel = script_path.relative_to(home)
+        # Expected layout: .<tool>/skills/<skill>/...
+        parts = rel.parts  # e.g. ('.cursor', 'skills', 'skillsafe', ...)
+        if (
+            len(parts) >= 3
+            and parts[0].startswith(".")
+            and parts[1] == "skills"
+        ):
+            raw = parts[0].lstrip(".")  # e.g. "cursor" or "agents"
+            return _dir_aliases.get(raw, raw)
+    except (ValueError, IndexError):
+        pass
+    return "cli"
+
+
+def _auth_browser(api_base: str) -> None:
+    """Authenticate via browser-based device authorization flow."""
+    client = SkillSafeClient(api_base=api_base)
+
+    # Detect the invoking tool for a richer API key label (e.g. "cursor")
+    label = _detect_tool()
+
+    # Step 1: Create a CLI auth session (15-minute TTL)
+    print("Starting browser login...\n")
+    try:
+        payload = json.dumps({"label": label}).encode()
+        result = client._request(
+            "POST", "/v1/auth/cli", auth=False,
+            body=payload, content_type="application/json",
+        )
+        data = result.get("data", result)
+        session_id: str = data["session_id"]
+        login_url: str = data["login_url"]
+        expires_in: int = int(data.get("expires_in", 900))
+        # Validate session_id format to prevent URL path injection
+        if not re.match(r'^[a-zA-Z0-9_-]{1,128}$', session_id):
+            print("Error: Server returned invalid session ID format.", file=sys.stderr)
+            sys.exit(1)
+    except SkillSafeError as e:
+        print(f"Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except (KeyError, TypeError):
+        print("Error: Unexpected response from server.", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 2: Open browser — validate URL scheme and host first
+    parsed_url = urllib.parse.urlparse(login_url)
+    if parsed_url.scheme not in ("https", "http"):
+        print(f"Error: Server returned unsafe login URL scheme: {parsed_url.scheme!r}", file=sys.stderr)
+        sys.exit(1)
+    # Only allow login URLs on the same host as the API or known SkillSafe domains
+    api_host = urllib.parse.urlparse(api_base).hostname or ""
+    allowed_hosts = {api_host, "skillsafe.ai", "www.skillsafe.ai", "localhost", "127.0.0.1"}
+    if parsed_url.hostname not in allowed_hosts:
+        print(f"Error: Server returned login URL for unexpected host: {parsed_url.hostname!r}", file=sys.stderr)
+        sys.exit(1)
+
+    expires_min = expires_in // 60
+    print(f"  Authorization URL (valid for {expires_min} min):\n")
+    print(f"    {bold(login_url)}\n")
+    print(f"  Open this URL in any browser to sign in.")
+    print(f"  Running as an AI agent without browser access? Share the URL above")
+    print(f"  with a human — they can open it on any machine to authorize you.\n")
+
+    try:
+        webbrowser.open(login_url)
+    except Exception:
+        pass  # URL is already printed as primary instruction
+
+    # Step 3: Poll for approval
+    print("  Waiting for authorization", end="", flush=True)
+
+    poll_interval = 2  # seconds
+    max_wait = expires_in  # match server TTL
+    elapsed = 0
+
+    while elapsed < max_wait:
+        try:
+            time.sleep(poll_interval)
+        except KeyboardInterrupt:
+            print()
+            print("\n  Authentication cancelled.", file=sys.stderr)
+            sys.exit(1)
+        elapsed += poll_interval
+
+        try:
+            resp = client._request("GET", f"/v1/auth/cli/{session_id}", auth=False)
+            data = resp.get("data", resp)
+            status = data.get("status")
+
+            if status == "approved":
+                print()  # newline after dots
+                _save_auth_result(data, api_base)
+                return
+
+            # Still pending — print a dot
+            print(".", end="", flush=True)
+
+        except KeyboardInterrupt:
+            print()
+            print("\n  Authentication cancelled.", file=sys.stderr)
+            sys.exit(1)
+        except SkillSafeError as e:
+            print()
+            if e.status == 410:
+                print(f"\n  {red('Session expired.')} Please try again.", file=sys.stderr)
+            else:
+                print(f"\n  Error: {e.message}", file=sys.stderr)
+            sys.exit(1)
+        except Exception:
+            print(".", end="", flush=True)
+
+    # Timeout
+    print()
+    print(f"\n  {red('Timed out')} waiting for browser authorization.", file=sys.stderr)
+    print(f"  You can still sign in at: {login_url}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _save_auth_result(data: Dict[str, Any], api_base: str) -> None:
+    """Save the credentials from a successful browser auth to config."""
+    api_key = data.get("api_key")
+    if not api_key or not isinstance(api_key, str) or not api_key.strip():
+        print("Error: Server returned invalid or empty API key. Authentication failed.", file=sys.stderr)
+        sys.exit(1)
+    cfg = {
+        "account_id": data.get("account_id", ""),
+        "username": data.get("username", ""),
+        "namespace": data.get("namespace", ""),
+        "api_key": api_key,
+        "api_base": api_base,
+    }
+    save_config(cfg)
+
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(green("\n  Authenticated successfully."))
+    print(f"  Account:   {cfg['account_id']}")
+    print(f"  Username:  {cfg['username']}")
+    print(f"  Namespace: {cfg['namespace']}")
+    print(f"  API key:   {dim(_mask_api_key(cfg['api_key']))}")
+    print(f"  Config:    {CONFIG_FILE}")
+
+
+def cmd_scan(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
+    """Scan a skill directory for security issues."""
+    path = Path(args.path).resolve()
+    if not path.is_dir():
+        print(f"Error: {path} is not a directory.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Scanning {bold(str(path))}...\n")
+    scanner = Scanner()
+
+    try:
+        report = scanner.scan(path)
+    except ScanError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Apply --ignore filter
+    ignore_rules: set = set()
+    if getattr(args, "ignore", None):
+        ignore_rules = {r.strip() for r in args.ignore.split(",")}
+    if ignore_rules:
+        report["findings_summary"] = [
+            f for f in report["findings_summary"] if f["rule_id"] not in ignore_rules
+        ]
+        report["findings_count"] = len(report["findings_summary"])
+        report["clean"] = len(report["findings_summary"]) == 0
+        score, grade = scanner._calculate_score(report["findings_summary"])
+        report["score"] = score
+        report["grade"] = grade
+
+    _print_scan_results(report)
+
+    # Optionally write report to file
+    if getattr(args, "output", None):
+        out_path = Path(args.output)
+        with open(out_path, "w") as f:
+            json.dump(report, f, indent=2)
+            f.write("\n")
+        print(f"\nReport written to {out_path}")
+
+    # --check: exit 1 if any HIGH or CRITICAL findings remain
+    if getattr(args, "check", False):
+        _high = {"critical", "high"}
+        if any(f.get("severity") in _high for f in report.get("findings_summary", [])):
+            sys.exit(1)
+
+    return report
+
+
+def cmd_save(args: argparse.Namespace) -> None:
+    """Save a skill to the registry (private by default)."""
+    cfg = require_config()
+    path = Path(args.path).resolve()
+    version: Optional[str] = getattr(args, "version", None)
+    description: Optional[str] = getattr(args, "description", None)
+    category: Optional[str] = getattr(args, "category", None)
+    tags_raw: Optional[str] = getattr(args, "tags", None)
+
+    if not path.is_dir():
+        print(f"Error: {path} is not a directory.", file=sys.stderr)
+        sys.exit(1)
+
+    # Validate semver format if version is explicitly provided
+    if version:
+        semver_re = r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$'
+        if not re.match(semver_re, version):
+            print(f"Error: Invalid version '{version}'. Expected semantic version (e.g. 1.0.0, 2.1.0-beta.1).", file=sys.stderr)
+            sys.exit(1)
+
+    name = path.name
+    namespace = cfg["username"]
+
+    # Read defaults from skillsafe.yaml if present (preferred), then .skillsafe.json
+    yaml_meta_path = path / "skillsafe.yaml"
+    if yaml_meta_path.exists():
+        try:
+            raw = yaml_meta_path.read_text()
+            # Minimal YAML parser for simple key: "value" lines
+            for line in raw.splitlines():
+                m = re.match(r'^name:\s*"?@?([^/"]+)/([^/"]+)"?', line)
+                if m:
+                    namespace, name = m.group(1), m.group(2)
+                    break
+                m2 = re.match(r'^name:\s*"?([^"@\s]+)"?', line)
+                if m2 and "/" not in m2.group(1):
+                    name = m2.group(1)
+        except OSError:
+            pass
+    else:
+        # Legacy .skillsafe.json fallback
+        local_meta_path = path / ".skillsafe.json"
+        if local_meta_path.exists():
+            try:
+                with open(local_meta_path) as f:
+                    local_meta = json.load(f)
+                if local_meta.get("name"):
+                    name = local_meta["name"]
+                if local_meta.get("namespace"):
+                    namespace = local_meta["namespace"].lstrip("@")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    _validate_skill_name(name)
+
+    if name in RESERVED_SKILL_NAMES:
+        print(f"  '{name}' is reserved and has no need to save.")
+        return
+
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+
+    # Auto-resolve version if not provided
+    if not version:
+        print(f"Resolving next version of {bold(f'@{namespace}/{name}')}...")
+        version = client.resolve_next_version(namespace, name)
+
+    print(f"Saving {bold(f'@{namespace}/{name}')} v{version}...\n")
+
+    # Step 1: Build file manifest
+    print("  Building file manifest...")
+    file_manifest = build_file_manifest(path)
+    total_size = sum(f["size"] for f in file_manifest)
+    total_size_kb = total_size / 1024
+    if total_size > MAX_ARCHIVE_SIZE:
+        print(f"Error: Total file size is {total_size_kb:.0f} KB, exceeds 10 MB limit.", file=sys.stderr)
+        sys.exit(1)
+    print(f"  Files: {len(file_manifest)}, total size: {total_size_kb:.1f} KB")
+
+    # Step 2: Compute v2 tree hash
+    tree_hash = compute_tree_hash_v2(file_manifest)
+    print(f"  Tree hash:    {dim(tree_hash[:30])}...")
+
+    # Step 2b: Check if latest version already has the same tree hash (no changes)
+    try:
+        meta = client.get_metadata(namespace, name, auth=True)
+        latest_ver = meta.get("latest_version")
+        if latest_ver:
+            versions_resp = client.get_versions(namespace, name, limit=1)
+            versions_data = versions_resp.get("data", [])
+            versions_list = versions_data if isinstance(versions_data, list) else []
+            if versions_list and versions_list[0].get("tree_hash") == tree_hash:
+                print(green(f"\n  No changes detected — latest version v{latest_ver} already has the same content."))
+                return
+    except SkillSafeError:
+        pass  # Skill doesn't exist yet, proceed
+
+    # Step 3: Scan (optional but recommended)
+    print("  Scanning for security issues...")
+    scanner = Scanner()
+    report = scanner.scan(path, tree_hash=tree_hash)
+    _print_scan_results(report, indent=2)
+
+    # Step 4: Negotiate delta upload
+    print("\n  Negotiating upload...")
+    try:
+        negotiate_result = client.negotiate(namespace, name, version, file_manifest)
+        needed_files = negotiate_result.get("needed_files", [])
+        existing_blobs = negotiate_result.get("existing_blobs", [])
+    except SkillSafeError as e:
+        print(f"\n  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+
+    needed_bytes = sum(f["size"] for f in file_manifest if f["path"] in needed_files)
+    print(f"  Need to upload: {len(needed_files)} file(s) ({needed_bytes / 1024:.1f} KB)")
+    if existing_blobs:
+        print(f"  Already on server: {len(existing_blobs)} blob(s) (skipped)")
+
+    # Step 5: Save to registry via v2 (with retry + version conflict re-resolution)
+    print("  Uploading to registry...")
+    changelog: Optional[str] = getattr(args, "changelog", None)
+
+    metadata: Dict[str, Any] = {"version": version}
+    if description:
+        metadata["description"] = description
+    if category:
+        metadata["category"] = category
+    if tags_raw:
+        metadata["tags"] = [t.strip() for t in tags_raw.split(",")]
+    if changelog:
+        metadata["changelog"] = changelog
+
+    max_retries = 3
+    result = None
+    version_re_resolved = False
+    for attempt in range(max_retries):
+        try:
+            result = client.save_v2(
+                namespace, name, metadata, file_manifest, needed_files, path,
+                scan_report_json=json.dumps(report),
+            )
+            break  # Success
+        except SkillSafeError as e:
+            # Handle version collision: re-resolve version and retry once
+            if (e.status == 409 or e.status == 422) and not version_re_resolved:
+                version_re_resolved = True
+                print(f"  Version {version} conflict, re-resolving...")
+                version = client.resolve_next_version(namespace, name)
+                metadata["version"] = version
+                # Re-negotiate with new version
+                try:
+                    negotiate_result = client.negotiate(namespace, name, version, file_manifest)
+                    needed_files = negotiate_result.get("needed_files", [])
+                except SkillSafeError as e_neg:
+                    print(f"\n  Error: {e_neg.message}", file=sys.stderr)
+                    sys.exit(1)
+                continue
+            # 429 Rate Limit: respect Retry-After
+            if e.status == 429 and e.retry_after and attempt < max_retries - 1:
+                print(yellow(f"\n  Rate limited, retrying in {e.retry_after}s..."))
+                time.sleep(e.retry_after)
+                continue
+            # Non-retryable client errors (4xx except 429)
+            if 400 <= e.status < 500:
+                print(f"\n  Error: {e.message}", file=sys.stderr)
+                sys.exit(1)
+            # Retryable server errors (5xx) or unknown
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt  # 1s, 2s
+                print(yellow(f"\n  Upload failed ({e.code}), retrying in {delay}s... ({attempt + 1}/{max_retries})"))
+                time.sleep(delay)
+            else:
+                print(f"\n  Error: {e.message}", file=sys.stderr)
+                sys.exit(1)
+        except (urllib.error.URLError, OSError) as e:
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt  # 1s, 2s
+                print(yellow(f"\n  Upload failed ({type(e).__name__}), retrying in {delay}s... ({attempt + 1}/{max_retries})"))
+                time.sleep(delay)
+            else:
+                print(f"\n  Error: Could not connect to the API. {e}", file=sys.stderr)
+                sys.exit(1)
+
+    if result is None:
+        print("Error: Upload failed after all retries.", file=sys.stderr)
+        sys.exit(1)
+
+    # Post-upload tree hash verification
+    server_tree_hash = result.get("tree_hash")
+    local_tree_hash = compute_tree_hash_v2(file_manifest)
+
+    if server_tree_hash != local_tree_hash:
+        print(yellow(f"\n  Warning: Tree hash mismatch!"))
+        print(f"    Local:  {local_tree_hash}")
+        print(f"    Server: {server_tree_hash}")
+        print(f"  This may indicate server processing issues or tampering.")
+        print(f"\n  Saved @{namespace}/{name}@{version}")
+        print(f"  Skill ID:   {result.get('skill_id')}")
+        print(f"  Version ID: {result.get('version_id')}")
+    else:
+        print(green(f"\n  Saved @{namespace}/{name}@{version}"))
+        print(f"  Skill ID:   {result.get('skill_id')}")
+        print(f"  Version ID: {result.get('version_id')}")
+        print(f"  Tree hash:  {server_tree_hash} (verified)")
+    if result.get("new_bytes") is not None:
+        print(f"  New bytes:  {result.get('new_bytes', 0) / 1024:.1f} KB")
+
+    # Update .skillsafe.json after successful save
+    try:
+        meta_data = {}
+        if local_meta_path.exists():
+            try:
+                with open(local_meta_path) as f:
+                    meta_data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                pass
+        meta_data.update({
+            "namespace": f"@{namespace}",
+            "name": name,
+            "version": version,
+            "tree_hash": server_tree_hash or tree_hash,
+            "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+        with open(local_meta_path, "w") as f:
+            json.dump(meta_data, f, indent=2)
+            f.write("\n")
+    except OSError:
+        pass
+
+    print(f"\n  To share this skill, run:")
+    print(f"    skillsafe share @{namespace}/{name} --version {version}")
+
+
+def cmd_share(args: argparse.Namespace) -> None:
+    """Create a share link for a saved skill."""
+    cfg = require_config()
+    namespace, name = parse_skill_ref(args.skill)
+    version: str = args.version
+    public: bool = getattr(args, "public", False)
+    expires: Optional[str] = getattr(args, "expires", None)
+
+    visibility = "public" if public else "private"
+
+    print(f"Sharing {bold(f'@{namespace}/{name}')} v{version} ({visibility})...\n")
+
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+
+    try:
+        result = client.share(namespace, name, version, visibility=visibility, expires_in=expires)
+    except SkillSafeError as e:
+        print(f"  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+
+    api_base = cfg.get("api_base", DEFAULT_API_BASE)
+    share_url = f"{api_base}{result.get('share_url', '')}"
+
+    print(green(f"  Share link created."))
+    print(f"  Share ID:    {result.get('share_id')}")
+    print(f"  Visibility:  {result.get('visibility')}")
+    if result.get("expires_at"):
+        print(f"  Expires:     {result.get('expires_at')}")
+    print(f"  Share URL:   {bold(share_url)}")
+    if visibility == "public":
+        print(f"\n  This skill is now discoverable via search.")
+    else:
+        print(f"\n  Share this URL with others to give them access.")
+
+
+def cmd_install(args: argparse.Namespace) -> None:
+    """Install a skill from the registry."""
+    cfg = load_config()  # May return empty dict if not authenticated
+
+    # Detect share link references (shr_ prefix or URL containing /share/shr_)
+    skill_ref = args.skill
+    share_id: Optional[str] = None
+    if skill_ref.startswith("shr_"):
+        share_id = skill_ref
+    elif "/share/shr_" in skill_ref:
+        share_id = skill_ref.split("/share/")[-1].split("?")[0]
+
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+
+    # ---------- Download ----------
+
+    dl_format: str = ""       # "files" (v2) or "archive" (v1)
+    dl_data: Any = None       # manifest dict (v2) or archive bytes (v1)
+    namespace: str = ""
+    name: str = ""
+    version: str = ""
+    server_tree_hash: str = ""
+
+    if share_id:
+        # Share link download path
+        print(f"Installing via share link {bold(share_id)}...\n")
+
+        print("  Downloading via share link...")
+        try:
+            dl_format, dl_data = client.download_via_share(share_id)
+        except SkillSafeError as e:
+            print(f"  Error: {e.message}", file=sys.stderr)
+            sys.exit(1)
+
+        # Regex for validating namespace/name/version from untrusted server responses
+        _safe_ident_re = r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,100}$'
+        _safe_version_re = r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$'
+
+        if dl_format == "files":
+            # v2 manifest — extract metadata
+            namespace = dl_data.get("namespace", "shared").lstrip("@")
+            name = dl_data.get("name", share_id)
+            version = dl_data.get("version", "unknown")
+            print(f"  Received v2 manifest: {len(dl_data.get('files', []))} file(s)")
+        else:
+            # v1 archive
+            archive_bytes, server_tree_hash, version = dl_data
+            print(f"  Downloaded {len(archive_bytes) / 1024:.1f} KB")
+            dl_data = archive_bytes  # normalize
+
+            if not version:
+                version = "unknown"
+
+            # Try to extract namespace/name from archive's SKILL.md
+            namespace = "shared"
+            name = share_id
+            try:
+                with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
+                    for member in tar.getmembers():
+                        if member.name == "SKILL.md" or member.name.endswith("/SKILL.md"):
+                            f = tar.extractfile(member)
+                            if f:
+                                text = f.read().decode("utf-8", errors="replace")
+                                for line in text.splitlines():
+                                    if line.startswith("name:"):
+                                        name = line[len("name:"):].strip()
+                                        break
+                            break
+            except Exception:
+                pass  # Use defaults if we can't parse SKILL.md
+
+        # Sanitize namespace/name/version from untrusted server response
+        # to prevent path traversal in install directories
+        if not re.match(_safe_ident_re, namespace):
+            print(f"Error: Invalid namespace '{namespace}' in share link response.", file=sys.stderr)
+            sys.exit(1)
+        if not re.match(_safe_ident_re, name):
+            print(f"Error: Invalid name '{name}' in share link response.", file=sys.stderr)
+            sys.exit(1)
+        if version != "unknown" and not re.match(_safe_version_re, version):
+            print(f"Error: Invalid version '{version}' in share link response.", file=sys.stderr)
+            sys.exit(1)
+
+    else:
+        namespace, name = parse_skill_ref(skill_ref)
+        version = getattr(args, "version", None) or ""
+
+        # Step 1: Resolve version
+        if not version:
+            print(f"Resolving latest version of {bold(f'@{namespace}/{name}')}...")
+            try:
+                meta = client.get_metadata(namespace, name, auth=True)
+                version = meta.get("latest_version", "")
+                if not version:
+                    print("Error: No published versions found.", file=sys.stderr)
+                    sys.exit(1)
+            except SkillSafeError as e:
+                print(f"Error: {e.message}", file=sys.stderr)
+                sys.exit(1)
+
+        # Validate version format to prevent path traversal via malicious server response
+        semver_re = r'^\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$'
+        if not re.match(semver_re, version):
+            print(f"Error: Invalid version '{version}'. Expected semantic version (e.g. 1.0.0).", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"Installing {bold(f'@{namespace}/{name}')} v{version}...\n")
+
+        # Step 2: Download
+        print("  Downloading...")
+        try:
+            dl_format, dl_data = client.download(namespace, name, version)
+        except SkillSafeError as e:
+            print(f"  Error: {e.message}", file=sys.stderr)
+            sys.exit(1)
+
+        if dl_format == "files":
+            print(f"  Received v2 manifest: {len(dl_data.get('files', []))} file(s)")
+        else:
+            archive_bytes, server_tree_hash = dl_data
+            dl_data = archive_bytes  # normalize
+            print(f"  Downloaded {len(archive_bytes) / 1024:.1f} KB")
+
+    # ---------- V2 path (file manifest) ----------
+
+    if dl_format == "files":
+        manifest = dl_data
+
+        # Reconstruct into a temp dir, scan, then move to final location
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            print("  Reconstructing skill from manifest...")
+            try:
+                local_tree_hash, cached_count, downloaded_count = install_from_manifest(
+                    client, manifest, tmppath, verbose=True
+                )
+            except SkillSafeError as e:
+                print(f"\n  Error: {e.message}", file=sys.stderr)
+                sys.exit(1)
+
+            print(f"  Files: {downloaded_count} downloaded, {cached_count} from cache")
+            print(f"  Tree hash verified: {dim(local_tree_hash[:30])}...")
+
+            # Scan reconstructed skill
+            print("  Scanning downloaded skill...")
+            scanner = Scanner()
+            consumer_report = scanner.scan(tmppath, tree_hash=local_tree_hash)
+            _print_scan_results(consumer_report, indent=2)
+
+            # Submit verification
+            print("\n  Submitting verification report...")
+            verdict, details = _submit_verification(client, namespace, name, version, consumer_report)
+
+            # Display verdict and prompt
+            if not _handle_verdict(verdict, details):
+                return
+
+            # Install to final location
+            _install_to_target(args, namespace, name, version, local_tree_hash, source_dir=tmppath)
+
+    # ---------- V1 path (archive) ----------
+
+    else:
+        archive_bytes = dl_data
+
+        # Verify tree hash
+        local_tree_hash = compute_tree_hash(archive_bytes)
+        if not server_tree_hash:
+            print("Warning: Server did not provide a tree hash. Cannot verify archive integrity.", file=sys.stderr)
+            print("Aborting installation for safety.", file=sys.stderr)
+            sys.exit(1)
+        if local_tree_hash != server_tree_hash:
+            print(red("\n  CRITICAL: Tree hash mismatch — possible tampering!"))
+            print(f"    Server:  {server_tree_hash}")
+            print(f"    Local:   {local_tree_hash}")
+            print("  Aborting installation.")
+            sys.exit(1)
+        print(f"  Tree hash verified: {dim(local_tree_hash[:30])}...")
+
+        # Extract to temp dir and scan
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            print("  Extracting archive...")
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
+                _safe_extractall(tar, tmppath)
+
+            print("  Scanning downloaded skill...")
+            scanner = Scanner()
+            consumer_report = scanner.scan(tmppath, tree_hash=local_tree_hash)
+            _print_scan_results(consumer_report, indent=2)
+
+        # Submit verification
+        print("\n  Submitting verification report...")
+        verdict, details = _submit_verification(client, namespace, name, version, consumer_report)
+
+        # Display verdict and prompt
+        if not _handle_verdict(verdict, details):
+            return
+
+        # Install to final location (from archive)
+        _install_to_target_archive(args, namespace, name, version, local_tree_hash, archive_bytes)
+
+
+def _submit_verification(
+    client: SkillSafeClient,
+    namespace: str,
+    name: str,
+    version: str,
+    consumer_report: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    """Submit a consumer verification report. Returns (verdict, details)."""
+    try:
+        verdict_result = client.verify(namespace, name, version, consumer_report)
+        return verdict_result.get("verdict", "unknown"), verdict_result.get("details", {})
+    except SkillSafeError as e:
+        if e.status in (401, 403):
+            print("  Verification skipped (sign in with 'skillsafe auth' to enable dual-side verification).")
+            return "skipped", {}
+        else:
+            print(f"  Warning: Verification failed due to error: {e.message}", file=sys.stderr)
+            print("  Continuing without verification.", file=sys.stderr)
+            return "error", {}
+
+
+def _handle_verdict(verdict: str, details: Dict[str, Any]) -> bool:
+    """Display verification verdict. Returns True to proceed, False to cancel."""
+    if verdict == "verified":
+        print(green("  Verified: publisher and consumer scans match."))
+    elif verdict == "divergent":
+        if details.get("ruleset_upgrade_divergence"):
+            print(yellow("  WARNING: Scan reports diverge due to scanner ruleset upgrade."))
+            print(f"    Publisher ruleset: {details.get('publisher_ruleset_version', '?')}")
+            print(f"    Your ruleset:      {details.get('consumer_ruleset_version', '?')}")
+            print("    The publisher's scan used an older ruleset that may have missed findings.")
+            print("    Recommendation: ask the publisher to re-scan and re-share with the current scanner.")
+        else:
+            print(yellow("  WARNING: Scan reports diverge."))
+        for key, val in details.items():
+            if key not in ("ruleset_upgrade_divergence", "publisher_ruleset_version", "consumer_ruleset_version"):
+                print(f"    {key}: {val}")
+        if sys.stdin.isatty():
+            try:
+                answer = input("  Install anyway? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = "n"
+        else:
+            answer = "n"
+            print("  Non-interactive mode: skipping divergent skill.")
+        if answer != "y":
+            print("  Installation cancelled.")
+            return False
+    elif verdict == "critical":
+        print(red("  CRITICAL: Tree hash mismatch detected by server!"))
+        for key, val in details.items():
+            print(f"    {key}: {val}")
+        print("  Aborting installation.")
+        sys.exit(1)
+    elif verdict in ("skipped", "error"):
+        pass  # Already printed reason above
+    else:
+        print(f"  Verdict: {verdict}")
+    return True
+
+
+def _write_install_metadata(
+    install_dir: Path,
+    namespace: str,
+    name: str,
+    version: str,
+    tree_hash: str,
+) -> None:
+    """Write .skillsafe.json and inject self-improvement frontmatter fields after install."""
+    # Write .skillsafe.json
+    try:
+        meta_path = install_dir / ".skillsafe.json"
+        meta_data = {
+            "namespace": f"@{namespace}",
+            "name": name,
+            "version": version,
+            "tree_hash": tree_hash,
+            "installed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        with open(meta_path, "w") as f:
+            json.dump(meta_data, f, indent=2)
+            f.write("\n")
+    except OSError:
+        pass
+
+    # Inject self-improvement frontmatter fields into SKILL.md
+    skill_md = install_dir / "SKILL.md"
+    if not skill_md.exists():
+        return
+    try:
+        text = skill_md.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines(True)  # keep line endings
+
+        # Find frontmatter boundaries (---\n ... ---\n)
+        if not lines or not lines[0].rstrip() == "---":
+            return  # No frontmatter
+
+        end_idx = None
+        for i in range(1, len(lines)):
+            if lines[i].rstrip() == "---":
+                end_idx = i
+                break
+        if end_idx is None:
+            return  # Malformed frontmatter
+
+        # Parse existing frontmatter fields
+        fm_lines = lines[1:end_idx]
+        existing_keys = set()
+        for line in fm_lines:
+            stripped = line.strip()
+            if ":" in stripped:
+                key = stripped.split(":", 1)[0].strip()
+                existing_keys.add(key)
+
+        # Build fields to inject (only if not already present)
+        inject = []
+        if "improvable" not in existing_keys:
+            inject.append("improvable: true\n")
+        if "registry" not in existing_keys:
+            inject.append(f'registry: "@{namespace}/{name}"\n')
+
+        if inject:
+            # Insert before closing ---
+            new_lines = lines[:end_idx] + inject + lines[end_idx:]
+            skill_md.write_text("".join(new_lines), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _maybe_hint_global_install(
+    args: argparse.Namespace,
+    namespace: str,
+    name: str,
+) -> None:
+    """After a failed global install, print alternative global install options.
+
+    Only shown when the user explicitly requested a global install (``--location global``)
+    and the install failed (e.g. permission error).
+    """
+    if getattr(args, "location", "project") != "global":
+        return
+
+    print(f"\n  To install globally with a different tool, re-run with --tool <name> --location global:")
+    for key, path in TOOL_SKILLS_DIRS.items():
+        label = TOOL_DISPLAY_NAMES.get(key, key)
+        print(f"    skillsafe install @{namespace}/{name} --tool {key:<12} --location global  # {label}: {path}")
+
+
+def _install_to_target(
+    args: argparse.Namespace,
+    namespace: str,
+    name: str,
+    version: str,
+    tree_hash: str,
+    source_dir: Path,
+) -> Path:
+    """Copy files from source_dir to the final install location. Returns install_dir."""
+    skills_dir = _resolve_skills_dir(args)
+
+    def _safe_copytree(src: Path, dst: Path) -> None:
+        """Copy tree from src to dst, skipping any symlinks for safety."""
+        source_names = {item.name for item in src.iterdir() if not item.is_symlink()}
+        # Remove stale files not present in source (from previous version)
+        if dst.exists():
+            for existing in list(dst.iterdir()):
+                if existing.name not in source_names:
+                    if existing.is_dir():
+                        shutil.rmtree(existing)
+                    else:
+                        existing.unlink()
+        for item in src.iterdir():
+            if ".." in item.name or os.sep in item.name:
+                continue  # Defense-in-depth: skip suspicious names
+            target = dst / item.name
+            if item.is_symlink():
+                continue  # Skip symlinks — never install them
+            if item.is_dir():
+                if target.exists():
+                    shutil.rmtree(target)
+                shutil.copytree(item, target, symlinks=False)
+            else:
+                shutil.copy2(item, target)
+
+    if skills_dir:
+        install_dir = skills_dir / name
+        try:
+            install_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(install_dir, 0o700)
+            except OSError:
+                pass
+            print(f"\n  Installing to {install_dir}...")
+            _safe_copytree(source_dir, install_dir)
+            print(green(f"\n  Installed @{namespace}/{name}@{version}"))
+            print(f"  Location: {install_dir}")
+        except (PermissionError, OSError) as e:
+            print(red(f"\n  Error: could not install to {install_dir}: {e}"), file=sys.stderr)
+            _maybe_hint_global_install(args, namespace, name)
+            raise
+    else:
+        install_dir = SKILLS_DIR / f"@{namespace}" / name / version
+        install_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(install_dir, 0o700)
+        except OSError:
+            pass
+        print(f"\n  Installing to {install_dir}...")
+        _safe_copytree(source_dir, install_dir)
+
+        # Update 'current' symlink
+        current_link = install_dir.parent / "current"
+        if current_link.is_symlink() or current_link.exists():
+            current_link.unlink()
+        if not re.match(r'^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9.]+)?$', version):
+            print(red(f"  Invalid version format: {version}"))
+            return install_dir
+        current_link.symlink_to(version)
+        print(green(f"\n  Installed @{namespace}/{name}@{version}"))
+        print(f"  Location: {install_dir}")
+
+    _write_install_metadata(install_dir, namespace, name, version, tree_hash)
+    _update_lockfile(namespace, name, version, tree_hash)
+    return install_dir
+
+
+def _install_to_target_archive(
+    args: argparse.Namespace,
+    namespace: str,
+    name: str,
+    version: str,
+    tree_hash: str,
+    archive_bytes: bytes,
+) -> Path:
+    """Extract a v1 archive to the final install location. Returns install_dir."""
+    skills_dir = _resolve_skills_dir(args)
+
+    if skills_dir:
+        install_dir = skills_dir / name
+        try:
+            # Clean stale files from previous version before extracting
+            if install_dir.exists():
+                shutil.rmtree(install_dir)
+            install_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(install_dir, 0o700)
+            except OSError:
+                pass
+            print(f"\n  Installing to {install_dir}...")
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
+                _safe_extractall(tar, install_dir)
+            print(green(f"\n  Installed @{namespace}/{name}@{version}"))
+            print(f"  Location: {install_dir}")
+        except (PermissionError, OSError) as e:
+            print(red(f"\n  Error: could not install to {install_dir}: {e}"), file=sys.stderr)
+            _maybe_hint_global_install(args, namespace, name)
+            raise
+    else:
+        install_dir = SKILLS_DIR / f"@{namespace}" / name / version
+        # Clean stale files from previous version before extracting
+        if install_dir.exists():
+            shutil.rmtree(install_dir)
+        install_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(install_dir, 0o700)
+        except OSError:
+            pass
+        print(f"\n  Installing to {install_dir}...")
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
+            _safe_extractall(tar, install_dir)
+
+        # Update 'current' symlink
+        current_link = install_dir.parent / "current"
+        if current_link.is_symlink() or current_link.exists():
+            current_link.unlink()
+        if not re.match(r'^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9.]+)?$', version):
+            print(red(f"  Invalid version format: {version}"))
+            return install_dir
+        current_link.symlink_to(version)
+        print(green(f"\n  Installed @{namespace}/{name}@{version}"))
+        print(f"  Location: {install_dir}")
+
+    _write_install_metadata(install_dir, namespace, name, version, tree_hash)
+    _update_lockfile(namespace, name, version, tree_hash)
+    return install_dir
+
+
+def cmd_search(args: argparse.Namespace) -> None:
+    """Search the skill registry."""
+    query: Optional[str] = getattr(args, "query", None)
+    category: Optional[str] = getattr(args, "category", None)
+    sort: str = getattr(args, "sort", "popular")
+    limit: int = getattr(args, "limit", 20)
+    page: Optional[int] = getattr(args, "page", None)
+    fetch_all: bool = getattr(args, "all", False)
+
+    cfg = load_config()
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE))
+
+    try:
+        if fetch_all:
+            # Auto-paginate: collect all results across pages using cursor
+            all_skills = []
+            cursor: Optional[str] = None
+            page_num = 1
+            while True:
+                resp = client.search(query=query, category=category, sort=sort, limit=100, cursor=cursor)
+                batch = resp.get("data", [])
+                all_skills.extend(batch)
+                pagination = (resp.get("meta") or {}).get("pagination", {})
+                has_more = pagination.get("has_more", False)
+                cursor = pagination.get("next_cursor")
+                if not has_more or not cursor:
+                    break
+                page_num += 1
+            skills = all_skills
+            pagination_info = f"{len(skills)} total"
+        else:
+            resp = client.search(query=query, category=category, sort=sort, limit=limit, page=page)
+            skills = resp.get("data", [])
+            pagination = (resp.get("meta") or {}).get("pagination", {})
+            has_more = pagination.get("has_more", False)
+            total_count = pagination.get("total_count")
+            total_pages = pagination.get("total_pages")
+            if total_count is not None:
+                pagination_info = f"{len(skills)} of {total_count} (page {page or 1}/{total_pages})"
+            elif has_more:
+                pagination_info = f"{len(skills)} (more available — use --page N or --all)"
+            else:
+                pagination_info = str(len(skills))
+    except SkillSafeError as e:
+        print(f"Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"Error: Could not connect to the API. {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not skills:
+        print("No skills found.")
+        return
+
+    print(f"Found {pagination_info} skill(s):\n")
+
+    # Table header
+    print(f"  {'SKILL':<35} {'VERSION':<10} {'STARS':<7} {'INSTALLS':<10} DESCRIPTION")
+    print(f"  {'─' * 35} {'─' * 10} {'─' * 7} {'─' * 10} {'─' * 30}")
+
+    for s in skills:
+        ns = s.get("namespace", "")
+        nm = s.get("name_display", s.get("name", ""))
+        ref = f"{ns}/{nm}"
+        ver = s.get("latest_version", "-")
+        stars = s.get("star_count", 0)
+        installs = s.get("install_count", 0)
+        desc = (s.get("description") or "")[:40]
+        print(f"  {ref:<35} {ver:<10} {stars:<7} {installs:<10} {desc}")
+
+
+def cmd_yank(args: argparse.Namespace) -> None:
+    """Yank a specific version of a skill (blocks future downloads of that version)."""
+    cfg = require_config()
+    namespace, name = parse_skill_ref(args.skill)
+    version: str = args.version
+    reason: str = getattr(args, "reason", "") or ""
+
+    print(f"Yanking {bold(f'@{namespace}/{name}')} v{version}...\n")
+
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+
+    try:
+        client.yank(namespace, name, version, reason=reason)
+    except SkillSafeError as e:
+        print(f"  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  Error: Could not connect to the API. {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(yellow(f"  Yanked @{namespace}/{name}@{version}"))
+    if reason:
+        print(f"  Reason: {reason}")
+    print(f"\n  This version is now blocked from download.")
+    print(f"  Other versions of the skill remain available.")
+    print(f"\n  To install a different version:")
+    print(f"    skillsafe install @{namespace}/{name} --version <other-version>")
+
+
+def cmd_import(args: argparse.Namespace) -> None:
+    """Import a skill from a GitHub or ClawHub URL as a public placeholder on SkillSafe."""
+    cfg = require_config()
+
+    raw_url: str = args.url.strip()
+    # Normalize bare URLs to https://
+    if not raw_url.startswith("http://") and not raw_url.startswith("https://"):
+        raw_url = "https://" + raw_url
+
+    # Detect source
+    if raw_url.startswith("https://github.com/"):
+        source = "github"
+    elif raw_url.startswith("https://clawhub.ai/"):
+        source = "clawhub"
+    else:
+        print(
+            "Error: Unsupported URL. Must be a GitHub URL (github.com/owner/repo) "
+            "or a ClawHub URL (clawhub.ai/owner/skill).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"Importing {bold(raw_url)} into SkillSafe...\n")
+
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+
+    try:
+        body = json.dumps({"url": raw_url}).encode()
+        result = client._request("POST", "/v1/skills/import-url", body=body, content_type="application/json")
+    except SkillSafeError as e:
+        print(f"  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  Error: Could not connect to the API. {e}", file=sys.stderr)
+        sys.exit(1)
+
+    data = result.get("data", {}) if isinstance(result, dict) else {}
+    namespace = data.get("namespace", "").lstrip("@")
+    name = data.get("name", "")
+    created = data.get("created", False)
+
+    source_label = "GitHub" if source == "github" else "ClawHub"
+    if created:
+        print(f"  {green('✓')} Imported from {source_label} as {bold(f'@{namespace}/{name}')}")
+    else:
+        print(f"  {bold(f'@{namespace}/{name}')} already exists — updated metadata from {source_label}")
+
+    if namespace and name:
+        print(f"\n  View at: https://skillsafe.ai/skill/{namespace}/{name}")
+        print(f"\n  {bold('Next steps:')}")
+        print(f"    skillsafe scan <local-path>        — scan and verify the skill files")
+        print(f"    skillsafe save <local-path>        — save a version")
+        print(f"    skillsafe share @{namespace}/{name}  — create a shareable link")
+
+
+def cmd_demo(args: argparse.Namespace) -> None:
+    """Upload a demo JSON recording for a skill version."""
+    cfg = require_config()
+    namespace, name = parse_skill_ref(args.skill)
+    version: str = args.version
+
+    json_path = args.json_file
+    if not os.path.isfile(json_path):
+        print(f"Error: File not found: {json_path}", file=sys.stderr)
+        sys.exit(1)
+
+    file_size = os.path.getsize(json_path)
+    max_bytes = 5 * 1024 * 1024  # 5 MB
+    if file_size > max_bytes:
+        print(f"Error: Demo file is too large ({file_size} bytes). Maximum size is 5 MB.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            demo_json = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in {json_path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not isinstance(demo_json, dict):
+        print("Error: Demo JSON must be an object.", file=sys.stderr)
+        sys.exit(1)
+
+    if demo_json.get("schema") != "skillsafe-demo/1":
+        print('Error: Invalid demo schema. Expected "skillsafe-demo/1".', file=sys.stderr)
+        sys.exit(1)
+
+    # Resolve title: --title flag > demo.title field > error
+    title: str = getattr(args, "title", "") or demo_json.get("title", "") or ""
+    title = title.strip()
+    if not title:
+        print("Error: title is required. Provide --title or set demo.title in the JSON.", file=sys.stderr)
+        sys.exit(1)
+    if len(title) > 200:
+        print("Error: title must be at most 200 characters.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Uploading demo for {bold(f'@{namespace}/{name}')} v{version}...\n")
+
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+
+    try:
+        result = client.upload_demo(namespace, name, version, demo_json, title=title)
+    except SkillSafeError as e:
+        print(f"  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  Error: Could not connect to the API. {e}", file=sys.stderr)
+        sys.exit(1)
+
+    demo_id = result.get("demo_id", "")
+    url = result.get("url", f"/demo/{demo_id}")
+    msg_count = result.get("message_count", 0)
+
+    print(f"  {bold('Demo uploaded successfully!')}")
+    print(f"  ID:       {demo_id}")
+    print(f"  Title:    {title}")
+    print(f"  Messages: {msg_count}")
+    print(f"  URL:      https://skillsafe.ai{url}")
+
+
+# ---------------------------------------------------------------------------
+# demo-from-session: convert Claude Code JSONL → skillsafe-demo/1 + upload
+# ---------------------------------------------------------------------------
+
+# Sensitive data patterns (ordered: more specific first)
+_MASK_PATTERNS: List[Tuple[str, str]] = [
+    (r"sk-ant-[A-Za-z0-9_\-]{20,}", "[ANTHROPIC_KEY]"),
+    (r"\bsk-[A-Za-z0-9]{20,}", "[API_KEY]"),
+    (r"ghp_[A-Za-z0-9]{36,}", "[GITHUB_TOKEN]"),
+    (r"github_pat_[A-Za-z0-9_]{59,}", "[GITHUB_TOKEN]"),
+    (r"AKIA[A-Z0-9]{16}", "[AWS_ACCESS_KEY]"),
+    (r"Bearer [A-Za-z0-9\-._~+/]+=*", "Bearer [TOKEN]"),
+    (r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", "[EMAIL]"),
+    (
+        r"(?i)(api[_\-]?key|secret[_\-]?key|access[_\-]?token|auth[_\-]?token)"
+        r"\s*[=:]\s*[\"']?([A-Za-z0-9_\-]{16,})[\"']?",
+        r"\1=[SECRET]",
+    ),
+]
+
+# User message content that should be skipped (system-injected tags)
+_SKIP_CONTENT_TAGS = (
+    "<local-command-caveat>",
+    "<local-command-stdout>",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<user-prompt-submit-hook>",
+    "<system-reminder>",
+    "<function_calls>",
+)
+
+
+def _mask_sensitive(text: str, home_dir: str = "") -> Tuple[str, int]:
+    """Mask sensitive data in *text*. Returns (masked_text, replacement_count)."""
+    count = 0
+    if home_dir and home_dir in text:
+        text = text.replace(home_dir, "~")
+        count += 1
+    for pattern, replacement in _MASK_PATTERNS:
+        new_text, n = re.subn(pattern, replacement, text)
+        if n:
+            text = new_text
+            count += n
+    return text, count
+
+
+def _truncate_output(text: str, max_lines: int = 120) -> str:
+    """Keep at most *max_lines* of a tool output, summarising the middle."""
+    lines = text.split("\n")
+    if len(lines) <= max_lines:
+        return text
+    head = (max_lines * 2) // 3
+    tail = max_lines // 6
+    omitted = len(lines) - head - tail
+    return "\n".join(lines[:head] + [f"[... {omitted} lines omitted ...]"] + lines[-tail:])
+
+
+def _format_tool_input(name: str, input_obj: Any) -> str:
+    """Render tool input as a human-readable string."""
+    if not isinstance(input_obj, dict):
+        return str(input_obj)[:500]
+    if name == "Bash":
+        return input_obj.get("command", json.dumps(input_obj))
+    if name == "Read":
+        return input_obj.get("file_path", json.dumps(input_obj))
+    if name == "Glob":
+        pat = input_obj.get("pattern", "")
+        path = input_obj.get("path", "")
+        return f"{pat} in {path}" if path else pat
+    if name == "Grep":
+        return input_obj.get("pattern", json.dumps(input_obj))
+    if name in ("Edit", "Write", "NotebookEdit"):
+        return input_obj.get("file_path", json.dumps(input_obj))
+    if name == "Agent":
+        return (input_obj.get("prompt") or json.dumps(input_obj))[:300]
+    return json.dumps(input_obj, ensure_ascii=False)[:500]
+
+
+def _convert_claude_session(
+    path: str,
+    filter_keyword: Optional[str] = None,
+    max_output_lines: int = 120,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Convert a Claude Code session JSONL to skillsafe-demo/1 message list.
+
+    Returns ``(messages, total_masked_count)``.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        entries = [json.loads(line) for line in f if line.strip()]
+
+    home_dir = str(Path.home())
+
+    # Pass 1 — build tool_use_id → output string map
+    tool_results: Dict[str, str] = {}
+    for entry in entries:
+        if entry.get("type") != "user":
+            continue
+        content = entry.get("message", {}).get("content", "")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "tool_result":
+                continue
+            tool_id = item.get("tool_use_id", "")
+            result = item.get("content", "")
+            if isinstance(result, list):
+                result = "\n".join(b.get("text", "") for b in result if isinstance(b, dict))
+            tool_results[tool_id] = str(result)
+
+    # Pass 2 — build messages list
+    messages: List[Dict[str, Any]] = []
+    total_masked = 0
+
+    for entry in entries:
+        msg_type = entry.get("type", "")
+        content = entry.get("message", {}).get("content", "")
+
+        if msg_type == "assistant":
+            if not isinstance(content, list):
+                continue
+            text_parts: List[str] = []
+            tool_uses: List[Dict[str, str]] = []
+
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text":
+                    t = item.get("text", "").strip()
+                    if t:
+                        t, n = _mask_sensitive(t, home_dir)
+                        total_masked += n
+                        text_parts.append(t)
+                elif item.get("type") == "tool_use":
+                    tool_id = item.get("id", "")
+                    tool_name = item.get("name", "")
+                    input_str = _format_tool_input(tool_name, item.get("input", {}))
+                    input_str, n = _mask_sensitive(input_str, home_dir)
+                    total_masked += n
+                    output_str = _truncate_output(tool_results.get(tool_id, ""), max_output_lines)
+                    output_str, n = _mask_sensitive(output_str, home_dir)
+                    total_masked += n
+                    tool_uses.append({"tool": tool_name, "input": input_str, "output": output_str})
+
+            if not text_parts and not tool_uses:
+                continue
+            msg: Dict[str, Any] = {"role": "assistant", "content": "\n\n".join(text_parts)}
+            if tool_uses:
+                msg["tool_uses"] = tool_uses
+            messages.append(msg)
+
+        elif msg_type == "user":
+            if isinstance(content, str):
+                if any(tag in content for tag in _SKIP_CONTENT_TAGS):
+                    continue
+                text = content.strip()
+                if not text:
+                    continue
+                text, n = _mask_sensitive(text, home_dir)
+                total_masked += n
+                messages.append({"role": "user", "content": text})
+            elif isinstance(content, list):
+                # Pure tool-result messages are already consumed via tool_results map
+                if all(isinstance(i, dict) and i.get("type") == "tool_result" for i in content if isinstance(i, dict)):
+                    continue
+                text_parts = []
+                for item in content:
+                    if not isinstance(item, dict) or item.get("type") != "text":
+                        continue
+                    t = item.get("text", "").strip()
+                    if t and not any(t.startswith(tag) for tag in _SKIP_CONTENT_TAGS):
+                        t, n = _mask_sensitive(t, home_dir)
+                        total_masked += n
+                        text_parts.append(t)
+                if text_parts:
+                    messages.append({"role": "user", "content": "\n\n".join(text_parts)})
+
+    # Optional keyword filter — keep messages that mention the keyword
+    if filter_keyword:
+        kw = filter_keyword.lower()
+        messages = [
+            m for m in messages
+            if kw in m.get("content", "").lower()
+            or any(
+                kw in u.get("tool", "").lower()
+                or kw in u.get("input", "").lower()
+                or kw in u.get("output", "").lower()
+                for u in m.get("tool_uses", [])
+            )
+        ]
+
+    return messages, total_masked
+
+
+def cmd_demo_from_session(args: argparse.Namespace) -> None:
+    """Convert a Claude Code session JSONL to skillsafe-demo/1 and optionally upload."""
+    session_path: str = args.session
+    if not os.path.isfile(session_path):
+        print(f"Error: Session file not found: {session_path}", file=sys.stderr)
+        sys.exit(1)
+
+    skill_ref: Optional[str] = getattr(args, "skill", None)
+    version: Optional[str] = getattr(args, "version", None)
+    title: str = (getattr(args, "title", None) or "").strip()
+    out_path: Optional[str] = getattr(args, "out", None)
+    filter_keyword: Optional[str] = getattr(args, "filter_keyword", None)
+    max_output_lines: int = getattr(args, "max_output_lines", 120)
+    no_upload: bool = getattr(args, "no_upload", False)
+
+    if not title:
+        print("Error: --title is required.", file=sys.stderr)
+        sys.exit(1)
+    if len(title) > 200:
+        print("Error: --title must be at most 200 characters.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Converting: {session_path}")
+    if filter_keyword:
+        print(f"Filter keyword: {filter_keyword!r}")
+
+    try:
+        messages, mask_count = _convert_claude_session(
+            session_path,
+            filter_keyword=filter_keyword,
+            max_output_lines=max_output_lines,
+        )
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"Error reading session file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not messages:
+        print("Error: No usable messages found (or all filtered out).", file=sys.stderr)
+        sys.exit(1)
+
+    demo_json: Dict[str, Any] = {
+        "schema": "skillsafe-demo/1",
+        "title": title,
+        "messages": messages,
+    }
+
+    size_bytes = len(json.dumps(demo_json).encode("utf-8"))
+    print(f"  Messages: {len(messages)}")
+    print(f"  Size:     {size_bytes:,} bytes")
+    if mask_count:
+        print(f"  Masked:   {mask_count} sensitive value(s) replaced")
+
+    if size_bytes > 5 * 1024 * 1024:
+        print(
+            f"\nError: Demo is too large ({size_bytes:,} bytes, max 5 MB).\n"
+            "Try --max-output-lines to truncate tool outputs more aggressively,\n"
+            "or --filter-keyword to keep only relevant messages.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # --- save to file -------------------------------------------------------
+    if out_path or no_upload or not skill_ref or not version:
+        target = out_path
+        if not target:
+            fd, target = tempfile.mkstemp(suffix=".json", prefix="skillsafe-demo-")
+            os.close(fd)
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump(demo_json, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        print(f"\nSaved to: {target}")
+        if skill_ref and version:
+            print(f"To upload: skillsafe demo {target} {skill_ref} --version {version}")
+        return
+
+    # --- upload directly ----------------------------------------------------
+    cfg = require_config()
+    namespace, name = parse_skill_ref(skill_ref)
+    print(f"\nUploading demo for {bold(f'@{namespace}/{name}')} v{version}...")
+
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+    try:
+        result = client.upload_demo(namespace, name, version, demo_json, title=title)
+    except SkillSafeError as e:
+        print(f"  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  Error: Could not connect to the API. {e}", file=sys.stderr)
+        sys.exit(1)
+
+    demo_id = result.get("demo_id", "")
+    url = result.get("url", f"/demo/{demo_id}")
+    print(f"  {bold('Demo uploaded successfully!')}")
+    print(f"  ID:       {demo_id}")
+    print(f"  Title:    {title}")
+    print(f"  Messages: {result.get('message_count', len(messages))}")
+    print(f"  URL:      https://skillsafe.ai{url}")
+
+
+def cmd_info(args: argparse.Namespace) -> None:
+    """Show detailed information about a skill."""
+    namespace, name = parse_skill_ref(args.skill)
+    cfg = load_config()
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg.get("api_key"))
+
+    try:
+        meta = client.get_metadata(namespace, name, auth=True)
+    except SkillSafeError as e:
+        print(f"Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"Error: Could not connect to the API. {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\n  {bold(meta.get('namespace', '') + '/' + meta.get('name_display', meta.get('name', '')))}")
+    print()
+    if meta.get("description"):
+        print(f"  {meta['description']}")
+        print()
+    print(f"  Latest version:    {meta.get('latest_version', '-')}")
+    print(f"  Category:          {meta.get('category', '-')}")
+    print(f"  Tags:              {meta.get('tags', '-')}")
+    print(f"  Installs:          {meta.get('install_count', 0)}")
+    print(f"  Stars:             {meta.get('star_count', 0)}")
+    print(f"  Verifications:     {meta.get('verification_count', 0)}")
+    print(f"  Status:            {meta.get('status', '-')}")
+    print(f"  Created:           {meta.get('created_at', '-')}")
+
+    # Fetch versions
+    try:
+        ver_resp = client.get_versions(namespace, name, limit=10, auth=True)
+        versions = ver_resp.get("data", [])
+        if versions:
+            print(f"\n  Recent versions:")
+            for v in versions:
+                ver = v.get("version", "?")
+                ts = (v.get("saved_at") or v.get("published_at") or "")[:10]
+                yanked = " (yanked)" if v.get("yanked") else ""
+                log = v.get("changelog") or ""
+                log_short = f" — {log[:50]}" if log else ""
+                print(f"    {ver:<12} {ts}{yanked}{log_short}")
+    except SkillSafeError:
+        pass  # Version list is optional
+
+    print()
+
+
+def _list_skills_in_dir(directory: Path) -> List[Tuple[str, str, str]]:
+    """List skills in a flat skills directory (each subdirectory is a skill).
+
+    Returns list of (name, description, version) tuples.
+    """
+    results: List[Tuple[str, str, str]] = []
+    if not directory.is_dir():
+        return results
+    for skill_dir in sorted(directory.iterdir()):
+        if not skill_dir.is_dir():
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        desc = ""
+        if skill_md.exists():
+            try:
+                text = skill_md.read_text(encoding="utf-8", errors="replace")
+                for line in text.splitlines():
+                    if line.startswith("description:"):
+                        desc = line[len("description:"):].strip()[:60]
+                        break
+            except Exception:
+                pass
+        # Read version from .skillsafe.json
+        ver = ""
+        meta_path = skill_dir / ".skillsafe.json"
+        if meta_path.exists():
+            try:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                ver = meta.get("version", "")
+            except (json.JSONDecodeError, OSError):
+                pass
+        results.append((skill_dir.name, desc, ver))
+    return results
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    """List locally installed skills."""
+
+    found_any = False
+
+    # 1. Well-known agent skills directories
+    for tool_key, agent_dir in TOOL_SKILLS_DIRS.items():
+        label = TOOL_DISPLAY_NAMES.get(tool_key, tool_key)
+        skills = _list_skills_in_dir(agent_dir)
+        if skills:
+            found_any = True
+            print(f"{bold(f'{label} skills')} ({agent_dir}):\n")
+            print(f"  {'SKILL':<30} {'VERSION':<10} DESCRIPTION")
+            print(f"  {'─' * 30} {'─' * 10} {'─' * 50}")
+            for name, desc, ver in skills:
+                print(f"  {name:<30} {ver or '-':<10} {desc}")
+            print()
+
+    # 2. Custom --skills-dir paths
+    extra_dirs = getattr(args, "skills_dir", None) or []
+    for dir_str in extra_dirs:
+        extra_path = Path(dir_str).expanduser().resolve()
+        skills = _list_skills_in_dir(extra_path)
+        if skills:
+            found_any = True
+            print(f"{bold('Skills')} ({extra_path}):\n")
+            print(f"  {'SKILL':<30} {'VERSION':<10} DESCRIPTION")
+            print(f"  {'─' * 30} {'─' * 10} {'─' * 50}")
+            for name, desc, ver in skills:
+                print(f"  {name:<30} {ver or '-':<10} {desc}")
+            print()
+
+    # 3. SkillSafe registry skills (~/.skillsafe/skills/)
+    if SKILLS_DIR.is_dir():
+        registry_skills: List[Tuple[str, str, str]] = []
+        for ns_dir in sorted(SKILLS_DIR.iterdir()):
+            if not ns_dir.is_dir():
+                continue
+            ns = ns_dir.name
+            for skill_dir in sorted(ns_dir.iterdir()):
+                if not skill_dir.is_dir():
+                    continue
+                current = skill_dir / "current"
+                version = "?"
+                if current.is_symlink():
+                    version = current.resolve().name
+                elif current.exists():
+                    version = current.name
+                else:
+                    versions = [d.name for d in skill_dir.iterdir() if d.is_dir() and d.name != "current"]
+                    def _semver_key(v: str) -> tuple:
+                        """Parse version string into a tuple for proper numeric sorting."""
+                        parts = v.split("-", 1)[0].split(".")
+                        try:
+                            return tuple(int(p) for p in parts)
+                        except ValueError:
+                            return (0,)
+                    version = sorted(versions, key=_semver_key)[-1] if versions else "?"
+                registry_skills.append((f"{ns}/{skill_dir.name}", version, str(skill_dir)))
+
+        if registry_skills:
+            found_any = True
+            print(f"{bold('SkillSafe registry skills')} ({SKILLS_DIR}):\n")
+            print(f"  {'SKILL':<35} {'VERSION':<12} PATH")
+            print(f"  {'─' * 35} {'─' * 12} {'─' * 40}")
+            for ref, ver, path in registry_skills:
+                print(f"  {ref:<35} {ver:<12} {path}")
+            print()
+
+    # 4. Project-level skills (per-tool subdir in cwd)
+    for tool_key, subdir in TOOL_PROJECT_SKILLS_SUBDIRS.items():
+        project_skills_dir = Path.cwd() / subdir
+        if project_skills_dir.is_dir():
+            proj_skills = _list_skills_in_dir(project_skills_dir)
+            if proj_skills:
+                found_any = True
+                label = TOOL_DISPLAY_NAMES.get(tool_key, tool_key)
+                print(f"{bold(f'Project skills ({label})')} ({project_skills_dir}):\n")
+                print(f"  {'SKILL':<30} {'VERSION':<10} DESCRIPTION")
+                print(f"  {'─' * 30} {'─' * 10} {'─' * 50}")
+                for name, desc, ver in proj_skills:
+                    print(f"  {name:<30} {ver or '-':<10} {desc}")
+                print()
+
+    if not found_any:
+        print("No skills installed.")
+        print()
+        for tool_key, agent_dir in TOOL_SKILLS_DIRS.items():
+            label = TOOL_DISPLAY_NAMES.get(tool_key, tool_key)
+            print(f"  {label + ' skills dir:':<25} {agent_dir}")
+        print(f"  {'SkillSafe skills dir:':<25} {SKILLS_DIR}")
+        for tool_key, subdir in TOOL_PROJECT_SKILLS_SUBDIRS.items():
+            label = TOOL_DISPLAY_NAMES.get(tool_key, tool_key)
+            print(f"  {label + ' project skills:':<25} ./{subdir}/")
+
+
+
+def cmd_eval(args: argparse.Namespace) -> None:
+    """Upload eval results for a skill version to SkillSafe."""
+    cfg = require_config()
+    namespace, name = parse_skill_ref(args.skill)
+    version: str = args.version
+
+    payload: Dict[str, Any] = {}
+
+    # Parse from eval JSON file (skill-creator format)
+    if getattr(args, "eval_json", None):
+        eval_path = Path(args.eval_json).expanduser().resolve()
+        if not eval_path.exists():
+            print(f"Error: Eval JSON file not found: {eval_path}", file=sys.stderr)
+            sys.exit(1)
+        with open(eval_path, "r", encoding="utf-8") as f:
+            eval_data = json.load(f)
+        # Support skill-creator summary format: { summary: { pass_rate, total, passed } }
+        summary = eval_data.get("summary", eval_data)
+        pass_rate = summary.get("pass_rate") or summary.get("passRate")
+        test_cases = summary.get("total") or summary.get("test_cases") or summary.get("testCases")
+        pass_count = summary.get("passed") or summary.get("pass_count")
+        model = summary.get("model") or eval_data.get("model")
+        payload["eval_json"] = json.dumps(eval_data)
+        if pass_rate is not None:
+            payload["pass_rate"] = float(pass_rate)
+        if test_cases is not None:
+            payload["test_cases"] = int(test_cases)
+        if pass_count is not None:
+            payload["pass_count"] = int(pass_count)
+        if model:
+            payload["model"] = str(model)
+    else:
+        # Manual stats
+        if getattr(args, "pass_rate", None) is not None:
+            payload["pass_rate"] = float(args.pass_rate)
+        if getattr(args, "test_cases", None) is not None:
+            payload["test_cases"] = int(args.test_cases)
+        if getattr(args, "pass_count", None) is not None:
+            payload["pass_count"] = int(args.pass_count)
+        if getattr(args, "model", None):
+            payload["model"] = args.model
+
+    if not payload:
+        print("Error: Provide --eval-json or at least --pass-rate.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Uploading eval results for {bold(f'@{namespace}/{name}')} v{version}...\n")
+
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+    try:
+        result = client._request(
+            "POST",
+            f"/v1/skills/@{namespace}/{name}/versions/{version}/eval",
+            body=json.dumps(payload).encode(),
+            content_type="application/json",
+        )
+    except SkillSafeError as e:
+        print(f"  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  Error: Could not connect to the API. {e}", file=sys.stderr)
+        sys.exit(1)
+
+    data = result.get("data", {}) if isinstance(result, dict) else {}
+    pass_rate_out = data.get("pass_rate")
+    test_cases_out = data.get("test_cases")
+
+    if pass_rate_out is not None:
+        rate_str = f"{pass_rate_out:.1f}%"
+        tier_note = f" {green('✅ Tested tier achieved!')} (≥80% pass rate, ≥5 test cases)" if pass_rate_out >= 80 and (test_cases_out or 0) >= 5 else ""
+        print(f"  {green('✓')} Eval uploaded — pass rate: {bold(rate_str)}{tier_note}")
+    else:
+        print(f"  {green('✓')} Eval uploaded")
+
+    # Show regression warning if applicable
+    regression = data.get("regression", {})
+    if regression.get("is_regression"):
+        prev_ver = regression.get("previous_version", "?")
+        prev_rate = regression.get("previous_pass_rate")
+        curr_rate = regression.get("current_pass_rate")
+        delta = regression.get("delta")
+        delta_str = f"{abs(delta):.1f}%" if delta is not None else "?"
+        print()
+        print(f"  {yellow('⚠ Regression detected:')} pass rate dropped {delta_str} from v{prev_ver}")
+        if prev_rate is not None and curr_rate is not None:
+            print(f"    {prev_ver}: {prev_rate:.1f}% → {version}: {curr_rate:.1f}%")
+        print(f"    Run `skillsafe eval @{namespace}/{name} --version {prev_ver}` to compare")
+
+
+def cmd_benchmark(args: argparse.Namespace) -> None:
+    """Upload benchmark results for a skill version to SkillSafe."""
+    cfg = require_config()
+    namespace, name = parse_skill_ref(args.skill)
+    version: str = args.version
+
+    payload: Dict[str, Any] = {
+        "benchmark_runs": int(args.runs),
+    }
+    if getattr(args, "avg_time", None) is not None:
+        payload["avg_time_s"] = float(args.avg_time)
+    if getattr(args, "avg_tokens", None) is not None:
+        payload["avg_tokens"] = int(args.avg_tokens)
+    if getattr(args, "variance", None) is not None:
+        payload["variance"] = float(args.variance)
+
+    print(f"Uploading benchmark for {bold(f'@{namespace}/{name}')} v{version} ({args.runs} runs)...\n")
+
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+    try:
+        result = client._request(
+            "POST",
+            f"/v1/skills/@{namespace}/{name}/versions/{version}/eval",
+            body=json.dumps(payload).encode(),
+            content_type="application/json",
+        )
+    except SkillSafeError as e:
+        print(f"  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  Error: Could not connect to the API. {e}", file=sys.stderr)
+        sys.exit(1)
+
+    data = result.get("data", {}) if isinstance(result, dict) else {}
+    avg_t = data.get("avg_time_s")
+    avg_tok = data.get("avg_tokens")
+    runs = data.get("benchmark_runs") or args.runs
+
+    parts = [f"{runs} runs"]
+    if avg_t is not None:
+        parts.append(f"avg {avg_t:.1f}s")
+    if avg_tok is not None:
+        parts.append(f"{avg_tok:,} tokens/run")
+    print(f"  {green('✓')} Benchmark uploaded — {', '.join(parts)}")
+
+
+def cmd_claim(args: argparse.Namespace) -> None:
+    """Claim a skill from another registry (ClawHub, GitHub) on SkillSafe."""
+    cfg = require_config()
+
+    source: str = args.source.strip()
+
+    # GitHub claim via import-github
+    if source.startswith("github.com/") or source.startswith("https://github.com/"):
+        raw_url = source if source.startswith("https://") else f"https://{source}"
+        print(f"Claiming GitHub skill {bold(raw_url)} on SkillSafe...\n")
+        client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+        try:
+            result = client._request(
+                "POST",
+                "/v1/skills/import-github",
+                body=json.dumps({"github_url": raw_url}).encode(),
+                content_type="application/json",
+            )
+        except SkillSafeError as e:
+            print(f"  Error: {e.message}", file=sys.stderr)
+            sys.exit(1)
+        except (urllib.error.URLError, OSError) as e:
+            print(f"  Error: Could not connect to the API. {e}", file=sys.stderr)
+            sys.exit(1)
+
+        data = result.get("data", {}) if isinstance(result, dict) else {}
+        ns = data.get("namespace", "").lstrip("@")
+        nm = data.get("name", "")
+        created = data.get("created", False)
+
+        if created:
+            print(f"  {green('✓')} Claimed as {bold(f'@{ns}/{nm}')}")
+        else:
+            print(f"  {bold(f'@{ns}/{nm}')} already exists — updated metadata from GitHub")
+        if ns and nm:
+            print(f"\n  View at: https://skillsafe.ai/skill/{ns}/{nm}")
+            print(f"\n  {bold('Next: verify the claim')}")
+            print(f"    skillsafe scan <local-path>           — scan skill files")
+            print(f"    skillsafe save <local-path>           — save a version")
+            print(f"    skillsafe eval @{ns}/{nm} --version 1.0.0 --eval-json eval.json")
+
+    # ClawHub migration instructions
+    elif source.startswith("clawhub:") or source.startswith("clawhub.dev/"):
+        ref = source.replace("clawhub:", "").replace("clawhub.dev/", "")
+        print(f"Claiming ClawHub skill {bold(ref)} on SkillSafe...\n")
+        print(f"  {yellow('ClawHub migration steps:')}")
+        print(f"  1. Clone or download the skill from ClawHub: {bold(f'clawhub.dev/{ref}')}")
+        print(f"  2. Run `skillsafe scan <local-path>` to verify it is safe")
+        print(f"  3. Run `skillsafe save <local-path>` to save it to your account")
+        print(f"  4. Run `skillsafe share @<ns>/<name>` to publish")
+        print(f"\n  {bold('Tip:')} Add a GitHub repo URL to auto-sync releases:")
+        print(f"    skillsafe claim github.com/owner/repo")
+
+    else:
+        print(f"Error: Unsupported source '{source}'.", file=sys.stderr)
+        print("  Supported: github.com/owner/repo, clawhub:owner/skill", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_skills_dir(args: argparse.Namespace) -> Optional[Path]:
+    """
+    Resolve the target skills directory from CLI flags.
+
+    --skills-dir <path>                        → use that path directly (overrides everything)
+    --tool <name> --location global            → tool's global skills dir (e.g. ~/.claude/skills/)
+    --tool <name> --location project (default) → tool's project subdir in cwd (e.g. .claude/skills/)
+    (no --tool)   --location project (default) → Path.cwd()
+    """
+    skills_dir = getattr(args, "skills_dir", None)
+    if skills_dir:
+        return Path(skills_dir).expanduser().resolve()
+    location = getattr(args, "location", None) or "project"
+    tool = getattr(args, "tool", None)
+    if tool and tool not in TOOL_SKILLS_DIRS:
+        print(f"Error: Unknown tool '{tool}'. Supported tools: {', '.join(TOOL_SKILLS_DIRS.keys())}", file=sys.stderr)
+        sys.exit(1)
+    if location == "global":
+        if not tool:
+            print("Error: --location global requires --tool <name>", file=sys.stderr)
+            sys.exit(1)
+        return TOOL_SKILLS_DIRS[tool]
+    # project (default)
+    if tool:
+        subdir = TOOL_PROJECT_SKILLS_SUBDIRS.get(tool, f".{tool}/skills")
+        return Path.cwd() / subdir
+    return Path.cwd()
+
+
+def _grade_color(grade: str) -> str:
+    """Return a colored grade string."""
+    if grade in ("A+", "A"):
+        return green(grade)
+    if grade == "B":
+        return cyan(grade)
+    if grade == "C":
+        return yellow(grade)
+    return red(grade)
+
+
+def _print_scan_results(report: Dict[str, Any], indent: int = 0) -> None:
+    """Pretty-print scan results."""
+    prefix = " " * indent
+    findings = report.get("findings_summary", [])
+    score = report.get("score")
+    grade = report.get("grade")
+
+    if score is not None and grade is not None:
+        grade_str = _grade_color(grade)
+        score_label = green(str(score)) if score >= 80 else (yellow(str(score)) if score >= 60 else red(str(score)))
+        print(f"{prefix}Score: {score_label}/100  Grade: {grade_str}\n")
+
+    if report.get("clean", True) and not findings:
+        print(f"{prefix}{green('No security issues found.')}")
+        return
+
+    print(f"{prefix}{yellow(f'Found {len(findings)} issue(s):')}\n")
+    for f in findings:
+        sev = format_severity(f.get("severity", "info"))
+        loc = f"{f.get('file', '?')}:{f.get('line', '?')}"
+        msg = f.get("message", "")
+        print(f"{prefix}  {sev} {loc:<35} {msg}")
+        ctx = f.get("context", "")
+        if ctx:
+            print(f"{prefix}           {dim(ctx[:100])}")
+
+
+def _update_lockfile(namespace: str, name: str, version: str, tree_hash: str) -> None:
+    """Update skillsafe.lock in the current working directory (if it exists or cwd is a project).
+
+    Uses advisory file locking (fcntl on Unix) to prevent concurrent installs
+    from losing each other's entries.
+    """
+    lockfile = Path.cwd() / "skillsafe.lock"
+
+    # Advisory file lock to prevent lost-update race with concurrent installs
+    lock_sentinel = lockfile.with_suffix(".lck")
+    lock_fd = None
+    try:
+        import fcntl
+        lock_sentinel.touch(exist_ok=True)
+        lock_fd = open(lock_sentinel, "r")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except (ImportError, OSError):
+        pass  # fcntl unavailable on Windows; proceed without locking
+
+    try:
+        lock_data: Dict[str, Any]
+        if lockfile.exists():
+            with open(lockfile, "r") as f:
+                try:
+                    lock_data = json.load(f)
+                except json.JSONDecodeError:
+                    print("Warning: Lockfile corrupted, starting fresh", file=sys.stderr)
+                    lock_data = {"lockfile_version": 1, "skills": {}}
+        else:
+            # Only create lockfile if there's a recognizable project marker
+            project_markers = ["package.json", "pyproject.toml", "Cargo.toml", "go.mod", ".git"]
+            if not any((Path.cwd() / m).exists() for m in project_markers):
+                return
+            lock_data = {"lockfile_version": 1, "skills": {}}
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        lock_data.setdefault("skills", {})[f"@{namespace}/{name}"] = {
+            "version": version,
+            "tree_hash": tree_hash,
+            "installed_at": now,
+        }
+
+        # Atomic write via temp file + os.replace to avoid corruption on crash
+        fd, tmp_path = tempfile.mkstemp(dir=str(lockfile.parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(lock_data, f, indent=2)
+                f.write("\n")
+            os.replace(tmp_path, str(lockfile))
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    finally:
+        if lock_fd is not None:
+            try:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+            lock_fd.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="skillsafe",
+        description="SkillSafe — secured skill registry client for AI coding tools.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            examples:
+              skillsafe auth                              # browser login
+              skillsafe scan ./my-skill
+              skillsafe save ./my-skill --version 1.0.0
+              skillsafe share @alice/my-skill --version 1.0.0
+              skillsafe share @alice/my-skill --version 1.0.0 --public
+              skillsafe install @alice/my-skill                                    # current folder (default)
+              skillsafe install @alice/my-skill --tool claude                     # .claude/skills/ in current project
+              skillsafe install @alice/my-skill --tool claude --location global   # global ~/.claude/skills/
+              skillsafe install @alice/my-skill --tool cursor --location global   # global ~/.cursor/skills/
+              skillsafe install @alice/my-skill --tool windsurf --location global # global ~/.windsurf/skills/
+              skillsafe install @alice/my-skill --tool codex --location global    # global ~/.agents/skills/
+              skillsafe install @alice/my-skill --tool gemini --location global   # global ~/.gemini/skills/
+              skillsafe install @alice/my-skill --tool opencode --location global # global ~/.config/opencode/skills/
+              skillsafe install @alice/my-skill --skills-dir ~/custom/skills
+              skillsafe search "salesforce automation"
+              skillsafe info @alice/my-skill
+              skillsafe list
+              skillsafe backup ~/.claude/skills/my-skill
+              skillsafe restore my-skill --tool claude --location global
+              skillsafe restore my-skill --tool windsurf --location global
+              skillsafe update                             # update CLI to latest version
+              skillsafe whoami                             # check auth status
+              skillsafe demo-from-session ~/.claude/projects/.../session.jsonl @alice/my-skill --version 1.0.0 --title "Installing a skill"
+              skillsafe demo-from-session session.jsonl --title "Preview" --no-upload
+              skillsafe demo-from-session session.jsonl @alice/my-skill --version 1.0.0 --title "Skill demo" --filter-keyword skillsafe
+        """),
+    )
+    parser.add_argument("--api-base", default=None, help="API base URL (default: %(default)s)")
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # -- auth ---------------------------------------------------------------
+    p_auth = subparsers.add_parser("auth", help="Authenticate via browser login")
+
+    # -- scan ---------------------------------------------------------------
+    p_scan = subparsers.add_parser("scan", help="Scan a skill directory for security issues")
+    p_scan.add_argument("path", help="Path to the skill directory")
+    p_scan.add_argument("-o", "--output", help="Write JSON report to file")
+    p_scan.add_argument("--check", action="store_true", help="Exit with code 1 if any HIGH or CRITICAL findings exist (CI mode)")
+    p_scan.add_argument("--ignore", metavar="RULES", help="Comma-separated rule IDs to suppress (e.g. git_hook_persist,unpinned_npm)")
+
+    # -- save ---------------------------------------------------------------
+    p_save = subparsers.add_parser("save", help="Save a skill to the registry (private by default)")
+    p_save.add_argument("path", help="Path to the skill directory")
+    p_save.add_argument("--version", help="Semantic version (e.g. 1.0.0). Omit to auto-increment patch.")
+    p_save.add_argument("--description", help="Skill description")
+    p_save.add_argument("--category", help="Skill category")
+    p_save.add_argument("--tags", help="Comma-separated tags")
+    p_save.add_argument("--changelog", help="What changed in this version")
+
+    # -- share --------------------------------------------------------------
+    p_share = subparsers.add_parser("share", help="Create a share link for a saved skill")
+    p_share.add_argument("skill", help="Skill reference (e.g. @alice/my-skill)")
+    p_share.add_argument("--version", required=True, help="Version to share (e.g. 1.0.0)")
+    p_share.add_argument("--public", action="store_true", help="Make skill discoverable via search")
+    p_share.add_argument("--expires", choices=["1d", "7d", "30d", "never"], help="Link expiration (default: never)")
+
+    # -- install ------------------------------------------------------------
+    p_install = subparsers.add_parser("install", help="Install or upgrade a skill from the registry")
+    p_install.add_argument("skill", help="Skill reference (e.g. @alice/my-skill)")
+    p_install.add_argument("--version", help="Specific version (default: latest)")
+    p_install.add_argument("--upgrade", action="store_true", help="Upgrade to latest if already installed")
+    p_install.add_argument("--tool", choices=list(TOOL_SKILLS_DIRS.keys()),
+        help="Tool name — determines the skills subdirectory (claude, cursor, windsurf, codex, gemini, opencode, openclaw, cline, roo, goose, copilot, kiro, trae, amp, aider, vscode)")
+    p_install.add_argument("--location", choices=["project", "global"], default="project",
+        help="Install location: project = tool's subdir in current folder (default), global = tool's global skills dir")
+    p_install.add_argument("--skills-dir", help="Override install path directly (ignores --tool and --location)")
+
+    # -- search -------------------------------------------------------------
+    p_search = subparsers.add_parser("search", help="Search for skills")
+    p_search.add_argument("query", nargs="?", help="Search query")
+    p_search.add_argument("--category", help="Filter by category")
+    p_search.add_argument("--sort", default="popular", choices=["popular", "recent", "verified", "trending", "hot"], help="Sort order")
+    p_search.add_argument("--limit", type=int, default=20, help="Max results per page (default: 20, max: 100)")
+    p_search.add_argument("--page", type=int, default=None, help="Page number for pagination (default: 1)")
+    p_search.add_argument("--all", action="store_true", help="Fetch all results across all pages")
+
+    # -- info ---------------------------------------------------------------
+    p_info = subparsers.add_parser("info", help="Get skill details")
+    p_info.add_argument("skill", help="Skill reference (e.g. @alice/my-skill)")
+
+    # -- list ---------------------------------------------------------------
+    p_list = subparsers.add_parser("list", help="List locally installed skills")
+    p_list.add_argument("--skills-dir", action="append", help="Additional skills directory to scan (can be repeated)")
+
+    # -- yank ---------------------------------------------------------------
+    p_yank = subparsers.add_parser("yank", help="Yank a version (blocks future downloads)")
+    p_yank.add_argument("skill", help="Skill reference (e.g. @alice/my-skill)")
+    p_yank.add_argument("--version", required=True, help="Version to yank (e.g. 1.0.0)")
+    p_yank.add_argument("--reason", help="Reason for yanking (shown in version listings)")
+
+    # -- demo ---------------------------------------------------------------
+    p_demo = subparsers.add_parser("demo", help="Upload a demo JSON recording for a skill version")
+    p_demo.add_argument("json_file", help="Path to demo JSON file (skillsafe-demo/1 schema)")
+    p_demo.add_argument("skill", help="Skill reference (e.g. @alice/my-skill)")
+    p_demo.add_argument("--version", required=True, help="Skill version (e.g. 1.0.0)")
+    p_demo.add_argument("--title", help="Override title from JSON (max 200 chars)")
+
+    # -- demo-from-session --------------------------------------------------
+    p_dfs = subparsers.add_parser(
+        "demo-from-session",
+        help="Convert a Claude Code session JSONL to a SkillSafe demo and upload it",
+    )
+    p_dfs.add_argument("session", help="Path to Claude Code session JSONL file (~/.claude/projects/.../session.jsonl)")
+    p_dfs.add_argument("skill", nargs="?", help="Skill reference (e.g. @alice/my-skill). Omit with --no-upload.")
+    p_dfs.add_argument("--version", help="Skill version (e.g. 1.0.0). Required when uploading.")
+    p_dfs.add_argument("--title", required=True, help="Demo title shown on skillsafe.ai (max 200 chars)")
+    p_dfs.add_argument("--out", metavar="FILE", help="Save converted JSON to FILE instead of uploading")
+    p_dfs.add_argument("--filter-keyword", metavar="WORD",
+        help="Keep only messages that contain WORD (e.g. 'skillsafe' to focus the demo on skill usage)")
+    p_dfs.add_argument("--max-output-lines", type=int, default=120, metavar="N",
+        help="Truncate tool outputs longer than N lines (default: 120)")
+    p_dfs.add_argument("--no-upload", action="store_true",
+        help="Convert and save to a temp file without uploading")
+
+    # -- whoami -------------------------------------------------------------
+    p_whoami = subparsers.add_parser("whoami", help="Show current authentication status and account info")
+
+    # -- upgrade ------------------------------------------------------------
+    # -- update (self-update CLI or upgrade skills) --------------------------
+    p_update = subparsers.add_parser(
+        "update",
+        help="Update skillsafe CLI or upgrade installed skills. "
+             "'update' or 'update skillsafe' updates the CLI from skillsafe.ai; "
+             "'update @ns/skill' upgrades a specific skill; "
+             "'update --all' upgrades all installed skills."
+    )
+    p_update.add_argument("skill", nargs="?", default=None,
+                          help="Skill to upgrade (e.g. @alice/my-skill), or 'skillsafe' to update the CLI (default)")
+    p_update.add_argument("--all", action="store_true", help="Upgrade all installed skills")
+    p_update.add_argument("--tool", choices=list(TOOL_SKILLS_DIRS.keys()), help="Limit --all to skills for a specific tool")
+    p_update.add_argument("--dry-run", action="store_true", help="Show what would be upgraded without applying changes")
+    p_update2 = subparsers.add_parser("self-update", help="Alias for: update skillsafe")
+
+    p_init = subparsers.add_parser("init", help="Initialize a skillsafe.yaml manifest in a skill directory")
+    p_init.add_argument("path", nargs="?", default=".", help="Path to skill directory (default: current directory)")
+
+    p_import = subparsers.add_parser("import", help="Import a skill from a GitHub or ClawHub URL")
+    p_import.add_argument("url", help="Skill URL (e.g. github.com/owner/repo or https://clawhub.ai/owner/skill)")
+
+    p_lint = subparsers.add_parser("lint", help="Validate a skillsafe.yaml manifest")
+    p_lint.add_argument("path", nargs="?", default=".", help="Path to skill directory (default: current directory)")
+
+    p_eval = subparsers.add_parser("eval", help="Upload eval results for a skill version")
+    p_eval.add_argument("skill", help="Skill reference (@namespace/name)")
+    p_eval.add_argument("--version", required=True, help="Version to attach eval results to (e.g. 1.0.0)")
+    p_eval.add_argument("--eval-json", metavar="FILE", help="Path to skill-creator eval JSON file")
+    p_eval.add_argument("--pass-rate", type=float, metavar="RATE", help="Pass rate (0–100)")
+    p_eval.add_argument("--test-cases", type=int, metavar="N", help="Total number of test cases")
+    p_eval.add_argument("--pass-count", type=int, metavar="N", help="Number of passing test cases")
+    p_eval.add_argument("--model", metavar="MODEL", help="Model used for evals (e.g. claude-opus-4-6)")
+
+    p_benchmark = subparsers.add_parser("benchmark", help="Upload benchmark results for a skill version")
+    p_benchmark.add_argument("skill", help="Skill reference (@namespace/name)")
+    p_benchmark.add_argument("--version", required=True, help="Version to attach benchmark results to")
+    p_benchmark.add_argument("--runs", type=int, required=True, help="Number of benchmark runs")
+    p_benchmark.add_argument("--avg-time", type=float, metavar="SECONDS", help="Average execution time in seconds")
+    p_benchmark.add_argument("--avg-tokens", type=int, metavar="N", help="Average tokens per run")
+    p_benchmark.add_argument("--variance", type=float, help="Variance in execution time")
+
+    p_claim = subparsers.add_parser("claim", help="Claim a skill from another registry (ClawHub, GitHub)")
+    p_claim.add_argument("source", help="Source ref: github.com/owner/repo or clawhub:owner/skill")
+
+    args = parser.parse_args(argv)
+
+    # Ensure api_base is set in the namespace (subcommand may not define it)
+    if not getattr(args, "api_base", None):
+        args.api_base = DEFAULT_API_BASE
+
+    # Validate --api-base scheme early (allow http only for localhost/127.0.0.1)
+    api_base_val = getattr(args, "api_base", DEFAULT_API_BASE) or DEFAULT_API_BASE
+    if api_base_val and not api_base_val.startswith("https://"):
+        parsed_base = urllib.parse.urlparse(api_base_val)
+        if parsed_base.hostname not in ("localhost", "127.0.0.1"):
+            print(f"Error: Refusing to use insecure HTTP API base: {api_base_val}. Use HTTPS.", file=sys.stderr)
+            sys.exit(1)
+
+    if args.command == "auth":
+        cmd_auth(args)
+    elif args.command == "scan":
+        cmd_scan(args)
+    elif args.command == "save":
+        cmd_save(args)
+    elif args.command == "share":
+        cmd_share(args)
+    elif args.command == "install":
+        cmd_install(args)
+    elif args.command == "search":
+        cmd_search(args)
+    elif args.command == "info":
+        cmd_info(args)
+    elif args.command == "list":
+        cmd_list(args)
+    elif args.command == "yank":
+        cmd_yank(args)
+    elif args.command == "demo":
+        cmd_demo(args)
+    elif args.command == "demo-from-session":
+        cmd_demo_from_session(args)
+    elif args.command == "whoami":
+        cmd_whoami(args)
+    elif args.command in ("update", "self-update", "upgrade"):
+        cmd_update(args)
+    elif args.command == "init":
+        cmd_init(args)
+    elif args.command == "import":
+        cmd_import(args)
+    elif args.command == "lint":
+        cmd_lint(args)
+    elif args.command == "eval":
+        cmd_eval(args)
+    elif args.command == "benchmark":
+        cmd_benchmark(args)
+    elif args.command == "claim":
+        cmd_claim(args)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+    # After any command that contacted the server, show update notice if available
+    _print_update_notice()
+
+
+if __name__ == "__main__":
+    main()
