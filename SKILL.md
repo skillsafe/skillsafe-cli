@@ -11,13 +11,60 @@ You have access to `skillsafe.py`, a Python client for the SkillSafe skill regis
 
 ## Setup
 
-Before running any command, ensure the CLI script exists. If `scripts/skillsafe.py` does not exist in this skill's directory, download it:
+### First-time installation from URL
+
+If you are installing this skill from `https://skillsafe.ai/skill.md` (not via the registry), download all required files into a skill directory:
 
 ```bash
-mkdir -p <skill-dir>/scripts && curl -fsSL https://skillsafe.ai/scripts/skillsafe.py -o <skill-dir>/scripts/skillsafe.py
+SKILL_DIR=".claude/skills/skillsafe"
+mkdir -p "$SKILL_DIR/scripts"
+
+# Skill definition and supporting docs
+curl -fsSL https://skillsafe.ai/skill.md -o "$SKILL_DIR/SKILL.md"
+curl -fsSL https://skillsafe.ai/submit-skill-demo.md -o "$SKILL_DIR/submit-skill-demo.md"
+curl -fsSL https://skillsafe.ai/submit-demo-comment.md -o "$SKILL_DIR/submit-demo-comment.md"
+
+# CLI script
+curl -fsSL https://skillsafe.ai/scripts/skillsafe.py -o "$SKILL_DIR/scripts/skillsafe.py"
 ```
 
-This is only needed for first-time installation from URL. If installed via `skillsafe install`, the script is already included.
+The complete skill directory should contain:
+```
+skillsafe/
+├── SKILL.md
+├── submit-skill-demo.md
+├── submit-demo-comment.md
+└── scripts/
+    └── skillsafe.py
+```
+
+### Updating an existing installation
+
+**Update all skill files** (`skillsafe.py`, `SKILL.md`, `submit-skill-demo.md`, `submit-demo-comment.md`) to the latest version:
+
+```bash
+python3 <skill-dir>/scripts/skillsafe.py update
+```
+
+This downloads all files from `https://skillsafe.ai` and replaces them in place. Each file is compared against the current version and skipped if already up to date.
+
+**Upgrade a registry-installed skill** to the latest registry version:
+
+```bash
+python3 <skill-dir>/scripts/skillsafe.py update @ns/name
+# or upgrade all installed skills at once:
+python3 <skill-dir>/scripts/skillsafe.py update --all
+```
+
+### Installing via registry
+
+If the skill is already published to the SkillSafe registry, install it directly:
+
+```bash
+python3 <skillsafe-cli>/scripts/skillsafe.py install @skillsafe/skillsafe
+```
+
+This is only needed for first-time URL installation or manual updates. If installed via `skillsafe install`, all files are already included.
 
 **Installing into the current project:** By default (no flags), `install` places the skill in `.claude/skills/` inside the current working directory so it is immediately available to the agent for this project. Use `--tool project` to make this explicit. Use `--tool <name>` (`claude`, `cursor`, `windsurf`, `codex`, `gemini`, `opencode`, `openclaw`, `cline`, `roo`, `goose`, `copilot`, `kiro`, `trae`, `amp`, `aider`, `vscode`, `antigravity`, `clawdbot`, `droid`, `kilo`) to install globally instead. For any other tool, use `--skills-dir <path>` with that tool's skills directory path.
 

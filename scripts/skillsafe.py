@@ -98,7 +98,7 @@ def _safe_extractall(tar: tarfile.TarFile, path: Union[str, Path]) -> None:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 RULESET_VERSION = "2026.03.01"
 SCANNER_TOOL = "skillsafe-scanner-py"
 DEFAULT_API_BASE = "https://api.skillsafe.ai"
@@ -2292,40 +2292,71 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
 
 
 def cmd_self_update(args: argparse.Namespace) -> None:
-    """Download the latest skillsafe.py from skillsafe.ai and replace this script."""
-    url = "https://skillsafe.ai/scripts/skillsafe.py"
+    """Download the latest skillsafe files from skillsafe.ai and replace them in place."""
+    skill_dir = Path(__file__).resolve().parent.parent  # scripts/ -> skill root
     script_path = Path(__file__).resolve()
+    base_url = "https://skillsafe.ai"
 
     print(f"  Current version: {bold(f'v{VERSION}')}")
-    print(f"  Checking {url} ...")
 
+    # --- Update skillsafe.py ---
+    py_url = f"{base_url}/scripts/skillsafe.py"
+    print(f"  Checking {py_url} ...")
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": f"skillsafe-cli/{VERSION}"})
+        req = urllib.request.Request(py_url, headers={"User-Agent": f"skillsafe-cli/{VERSION}"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             new_src = resp.read()
     except Exception as e:
         print(f"\n{red('Error:')} Could not download update: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Extract version from downloaded script
     m = re.search(rb'^VERSION\s*=\s*["\']([^"\']+)["\']', new_src, re.MULTILINE)
     new_version = m.group(1).decode() if m else "unknown"
 
     if new_version != "unknown" and _parse_semver(new_version) <= _parse_semver(VERSION):
         print(f"\n{green('Already up to date.')} (v{VERSION})")
+        script_updated = False
+    else:
+        tmp = script_path.with_suffix(".py.tmp")
+        try:
+            tmp.write_bytes(new_src)
+            tmp.replace(script_path)
+        except OSError as e:
+            print(f"\n{red('Error:')} Could not write update: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  {green(f'skillsafe.py: v{VERSION} → v{new_version}')}")
+        script_updated = True
+
+    # --- Update skill definition files ---
+    skill_files = [
+        ("skill.md", "SKILL.md"),
+        ("submit-skill-demo.md", "submit-skill-demo.md"),
+        ("submit-demo-comment.md", "submit-demo-comment.md"),
+    ]
+    files_updated = 0
+    for remote_name, local_name in skill_files:
+        url = f"{base_url}/{remote_name}"
+        dest = skill_dir / local_name
+        if not dest.parent.exists():
+            continue
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": f"skillsafe-cli/{VERSION}"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                new_content = resp.read()
+        except Exception as e:
+            print(f"  {red('Warning:')} Could not fetch {remote_name}: {e}")
+            continue
+        existing = dest.read_bytes() if dest.exists() else b""
+        if new_content != existing:
+            dest.write_bytes(new_content)
+            print(f"  {green('Updated:')} {local_name}")
+            files_updated += 1
+        else:
+            print(f"  {local_name}: already up to date")
+
+    if not script_updated and files_updated == 0:
         return
-
-    # Write atomically via temp file
-    tmp = script_path.with_suffix(".py.tmp")
-    try:
-        tmp.write_bytes(new_src)
-        tmp.replace(script_path)
-    except OSError as e:
-        print(f"\n{red('Error:')} Could not write update: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"\n{green(f'Updated: v{VERSION} → v{new_version}')}")
-    print(f"  {script_path}")
+    print(f"\n{green('Self-update complete.')}")
 
 
 def cmd_auth(args: argparse.Namespace) -> None:
