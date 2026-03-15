@@ -16,13 +16,15 @@ You have access to `skillsafe.py`, a Python client for the SkillSafe skill regis
 Requires Python 3. Download the CLI script and run `update` to pull all remaining files:
 
 ```bash
-SKILL_DIR=".claude/skills/skillsafe"
+SKILL_DIR="~/.claude/skills/skillsafe"
 mkdir -p "$SKILL_DIR/scripts"
 curl -fsSL https://skillsafe.ai/scripts/skillsafe.py -o "$SKILL_DIR/scripts/skillsafe.py"
 python3 "$SKILL_DIR/scripts/skillsafe.py" update
 ```
 
 This installs `SKILL.md`, `submit-skill-demo.md`, and `submit-demo-comment.md` alongside the script.
+
+> The example above installs globally for Claude Code (`~/.claude/skills/`). Replace `SKILL_DIR` with the appropriate path for your tool — see the tool directory list in the Configuration section below.
 
 ### Updating
 
