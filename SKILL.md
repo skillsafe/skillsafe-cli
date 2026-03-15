@@ -11,42 +11,26 @@ You have access to `skillsafe.py`, a Python client for the SkillSafe skill regis
 
 ## Setup
 
-### First-time installation from URL
+### Installation
 
-If you are installing this skill from `https://skillsafe.ai/skill.md` (not via the registry), download all required files into a skill directory:
+Requires Python 3. Download the CLI script and run `update` to pull all remaining files:
 
 ```bash
 SKILL_DIR=".claude/skills/skillsafe"
 mkdir -p "$SKILL_DIR/scripts"
-
-# Skill definition and supporting docs
-curl -fsSL https://skillsafe.ai/skill.md -o "$SKILL_DIR/SKILL.md"
-curl -fsSL https://skillsafe.ai/submit-skill-demo.md -o "$SKILL_DIR/submit-skill-demo.md"
-curl -fsSL https://skillsafe.ai/submit-demo-comment.md -o "$SKILL_DIR/submit-demo-comment.md"
-
-# CLI script
 curl -fsSL https://skillsafe.ai/scripts/skillsafe.py -o "$SKILL_DIR/scripts/skillsafe.py"
+python3 "$SKILL_DIR/scripts/skillsafe.py" update
 ```
 
-The complete skill directory should contain:
-```
-skillsafe/
-├── SKILL.md
-├── submit-skill-demo.md
-├── submit-demo-comment.md
-└── scripts/
-    └── skillsafe.py
-```
+This installs `SKILL.md`, `submit-skill-demo.md`, and `submit-demo-comment.md` alongside the script.
 
-### Updating an existing installation
+### Updating
 
-**Update all skill files** (`skillsafe.py`, `SKILL.md`, `submit-skill-demo.md`, `submit-demo-comment.md`) to the latest version:
+To update all skill files to the latest version:
 
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py update
 ```
-
-This downloads all files from `https://skillsafe.ai` and replaces them in place. Each file is compared against the current version and skipped if already up to date.
 
 **Upgrade a registry-installed skill** to the latest registry version:
 
