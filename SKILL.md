@@ -24,7 +24,7 @@ python3 "$SKILL_DIR/scripts/skillsafe.py" update
 
 This installs `SKILL.md`, `submit-skill-demo.md`, and `submit-demo-comment.md` alongside the script.
 
-> The example above installs globally for Claude Code (`~/.claude/skills/`). Replace `SKILL_DIR` with the appropriate path for your tool — see the tool directory list in the Configuration section below.
+> The example above installs globally for Claude Code (`~/.claude/skills/`). Replace `SKILL_DIR` with the appropriate path for your tool.
 
 ### Updating
 
