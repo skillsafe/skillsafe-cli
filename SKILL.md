@@ -56,16 +56,6 @@ python3 <skill-dir>/scripts/skillsafe.py update @ns/name
 python3 <skill-dir>/scripts/skillsafe.py update --all
 ```
 
-### Installing via registry
-
-If the skill is already published to the SkillSafe registry, install it directly:
-
-```bash
-python3 <skillsafe-cli>/scripts/skillsafe.py install @skillsafe/skillsafe
-```
-
-This is only needed for first-time URL installation or manual updates. If installed via `skillsafe install`, all files are already included.
-
 **Installing into the current project:** By default (no flags), `install` places the skill in `.claude/skills/` inside the current working directory so it is immediately available to the agent for this project. Use `--tool project` to make this explicit. Use `--tool <name>` (`claude`, `cursor`, `windsurf`, `codex`, `gemini`, `opencode`, `openclaw`, `cline`, `roo`, `goose`, `copilot`, `kiro`, `trae`, `amp`, `aider`, `vscode`, `antigravity`, `clawdbot`, `droid`, `kilo`) to install globally instead. For any other tool, use `--skills-dir <path>` with that tool's skills directory path.
 
 ## Available Commands
