@@ -1,6 +1,6 @@
 ---
 name: skillsafe
-version: 0.1.3
+version: 0.1.4
 description: Scan, save, share, install, and verify skills from the SkillSafe secured skill registry. Use this skill whenever the user mentions scanning a skill for security issues, saving or publishing a skill to a registry, sharing a skill via a link, installing someone else's skill, searching for skills, uploading a demo recording, checking skill verification status, or anything involving skill versioning, the SkillSafe CLI, or managing AI coding tool skills — even if they don't say "SkillSafe" explicitly. Also use it when the user asks to record a conversation as a demo or wants to showcase how a skill works.
 allowed-tools: Bash, Read, Write
 ---
@@ -64,11 +64,18 @@ First checks if a saved API key in `~/.skillsafe/config.json` is still valid. If
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py scan <path>
 ```
-Runs 4 scan passes:
+Runs 11 scan passes:
 1. **Python AST analysis** — detects `eval()`, `exec()`, `os.system()`, `subprocess.*`, etc.
 2. **JS/TS regex analysis** — detects `eval()`, `new Function()`, `child_process`, etc.
 3. **Secret detection** — AWS keys, GitHub tokens, private keys, generic API keys
-4. **Prompt injection** — detects manipulation patterns in .md files
+4. **Prompt injection + inducement language** — explicit override patterns and softer social-engineering phrases in `.md`/`.txt`/`.yaml` files (e.g. "run the included setup script", "for the tool to function")
+5. **Shell threat patterns** — exfiltration, persistence, reverse shells, recon, ClickFix
+6. **Binary file detection** — bundled executables/libraries
+7. **base64 deep-scan** — decodes blobs and re-scans for hidden payloads
+8. **Unicode obfuscation** — zero-width chars, Cyrillic/Latin homographs
+9. **Structural mimicry** — fake `## Prerequisites` / `## Environment Setup` section headers followed by bundled-script execution references within 10 lines; urgency markers (`**IMPORTANT**`, `> WARNING`) adjacent to script execution (SkillJect SS-SM)
+10. **Composite capability co-occurrence** — escalates when a single file combines process execution + network calls (critical), env reads + network (high), or accumulates 3+ medium findings (high)
+11. **Surplus functionality** — cross-references script capabilities (network, env reads, subprocess, file writes) against `SKILL.md` documentation; flags capabilities present in code but absent from docs
 
 ### Save — Save a skill to the registry (private by default)
 ```bash

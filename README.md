@@ -46,7 +46,7 @@ curl -fsSL https://skillsafe.ai/scripts/skillsafe.py -o <skill-dir>/scripts/skil
 | Command | Description |
 |---------|-------------|
 | `auth` | Sign in via browser, saves API key to `~/.skillsafe/config.json` |
-| `scan <path>` | Run 4-pass security scan (Python AST, JS/TS regex, secrets, prompt injection) |
+| `scan <path>` | Run 11-pass security scan (AST, secrets, injection, structural mimicry, composite patterns, surplus functionality) |
 | `save <path>` | Save a skill privately to the registry |
 | `share @ns/name` | Create a share link for a saved skill |
 | `install @ns/name` | Download, verify, scan, and install a skill |
@@ -78,7 +78,7 @@ python3 -m unittest discover -s tests -v
 
 ```
 SKILL.md              # Skill definition (source of truth)
-scripts/skillsafe.py  # CLI client (stdlib only, ~1800 lines)
+scripts/skillsafe.py  # CLI client (stdlib only, ~5000 lines)
 tests/test_skillsafe.py  # Test suite
 LICENSE               # MIT
 ```

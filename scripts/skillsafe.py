@@ -98,8 +98,8 @@ def _safe_extractall(tar: tarfile.TarFile, path: Union[str, Path]) -> None:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.1.3"
-RULESET_VERSION = "2026.03.01"
+VERSION = "0.1.4"
+RULESET_VERSION = "2026.03.15"
 SCANNER_TOOL = "skillsafe-scanner-py"
 DEFAULT_API_BASE = "https://api.skillsafe.ai"
 
@@ -376,15 +376,18 @@ class Scanner:
     """
     Security scanner for skill directories.
 
-    Performs eight scan passes:
+    Performs eleven scan passes:
       1. Python static analysis (AST-based)
       2. JavaScript / TypeScript static analysis (regex-based)
       3. Secret detection (regex on all text files)
-      4. Prompt injection detection (regex on .md files)
+      4. Prompt injection + inducement language detection (regex on .md/.txt/.yaml files)
       5. Shell / general threat patterns (exfil, persistence, reverse shell, recon, …)
       6. Binary file detection (bundled executables/libraries)
       7. base64 deep-scan (decode blobs and re-check for dangerous payloads)
       8. Unicode obfuscation detection (zero-width chars, Cyrillic/Latin homographs)
+      9. Structural mimicry detection (multi-line context scan on .md files)
+     10. Composite capability co-occurrence (exec+network, env+network, clusters)
+     11. Surplus functionality (script capabilities not documented in SKILL.md)
     """
 
     # -- Dangerous Python function patterns (AST-based) ---------------------
@@ -443,6 +446,7 @@ class Scanner:
     # -- Prompt injection patterns ------------------------------------------
 
     _INJECTION_PATTERNS: List[Tuple[str, str, str, str]] = [
+        # Explicit override / role-hijack patterns
         (r"ignore\s+(?:all\s+)?(?:(?:previous|prior|above)\s+)?instructions", "prompt_ignore_instructions", "high", "Prompt injection: ignore instructions"),
         (r"you\s+are\s+now", "prompt_role_hijack", "high", "Prompt injection: role hijacking"),
         (r"system\s+prompt", "prompt_system_prompt", "medium", "Prompt injection: system prompt reference"),
@@ -451,6 +455,15 @@ class Scanner:
         (r"override\s+(?:(?:previous|prior)\s+)?instructions", "prompt_override", "high", "Prompt injection: override instructions"),
         (r"forget\s+(?:everything|all|previous)", "prompt_forget", "high", "Prompt injection: forget instructions"),
         (r"do\s+not\s+follow\s+(?:the\s+)?(?:(?:previous|prior|above)\s+)?instructions", "prompt_do_not_follow", "high", "Prompt injection: do not follow instructions"),
+        # Inducement language — softer social engineering that nudges agents to run
+        # bundled scripts without explicit override language. Discovered via SkillJect
+        # trace-driven refinement (SS-SI); these phrases evade explicit-override filters.
+        (r"before\s+(?:using|running|proceeding)[,\s]+(?:run|execute|source)\b", "inducement_before_using", "medium", "Inducement: pre-task script nudge — 'before using, run' pattern (SS-SI01)"),
+        (r"for\s+(?:the\s+)?(?:tool|this\s+skill|it)\s+to\s+(?:work|function|operate)\b", "inducement_for_tool_to_work", "medium", "Inducement: necessity framing — 'for the tool to work' pattern (SS-SI02)"),
+        (r"this\s+(?:setup|initialization|configuration|install(?:ation)?)\s+step\s+is\s+(?:required|necessary|mandatory)\b", "inducement_required_step", "medium", "Inducement: required-step framing (SS-SI03)"),
+        (r"run\s+the\s+(?:included|bundled|provided|attached)\s+(?:script|setup|installer|helper)\b", "inducement_run_bundled", "high", "Inducement: explicit bundled-script nudge (SS-SI04)"),
+        (r"automatically\s+(?:run|execute|invoke)\s+\S+\.(?:sh|py|bash)\b", "inducement_auto_exec", "high", "Inducement: automatic script execution instruction (SS-SI05)"),
+        (r"must\s+(?:be\s+)?(?:run|executed?|sourced?)\s+(?:before|first|prior)\b", "inducement_must_run_first", "medium", "Inducement: mandatory pre-execution framing (SS-SI06)"),
     ]
 
     _INJECTION_COMPILED: Optional[List[Tuple[re.Pattern, str, str, str]]] = None
@@ -534,6 +547,52 @@ class Scanner:
     _B64_RE: Optional[re.Pattern] = None
     _DANGER_RE: Optional[re.Pattern] = None
 
+    # -- Passes 9–11: script extension set and lookahead constants -----------
+
+    _SCRIPT_EXTENSIONS: frozenset = frozenset({
+        ".py", ".sh", ".bash", ".zsh", ".fish", ".js", ".ts", ".mjs", ".cjs",
+    })
+
+    # Lines to scan after a suspicious section header / urgency marker.
+    _SECTION_LOOKAHEAD: int = 10
+    _URGENCY_LOOKAHEAD: int = 3
+
+    # -- Pass 9 compiled patterns (structural mimicry) ----------------------
+    _SECTION_RE: Optional[re.Pattern] = None
+    _EXEC_REF_RE: Optional[re.Pattern] = None
+    _URGENCY_RE: Optional[re.Pattern] = None
+
+    # -- Passes 10–11 compiled capability-detection patterns ----------------
+    # Shared between composite (pass 10) and surplus-functionality (pass 11).
+    _CAP_NET_RE: Optional[re.Pattern] = None    # outbound network call
+    _CAP_ENV_RE: Optional[re.Pattern] = None    # environment variable read
+    _CAP_EXEC_RE: Optional[re.Pattern] = None   # process / subprocess execution
+    _CAP_WRITE_RE: Optional[re.Pattern] = None  # file write
+
+    # -- Pass 11 SKILL.md documentation keyword sets -----------------------
+    # Wide nets to avoid false positives on informal documentation language.
+    # "run" and other ultra-common words are intentionally excluded from
+    # _DOC_SUBPROCESS; "file"/"create"/"log" from _DOC_FILE_WRITE — they appear
+    # in virtually every skill's documentation and destroy discriminative power.
+    _DOC_NETWORK: frozenset = frozenset({
+        "network", "http", "https", "api", "request", "download", "upload",
+        "fetch", "send", "post", "webhook", "url", "endpoint", "connect",
+        "internet", "remote", "server", "client", "web",
+    })
+    _DOC_ENV: frozenset = frozenset({
+        "environment", "env var", "env_var", "credential", "api key", "api_key",
+        "token", "secret", "config", "variable", "getenv", "environ",
+    })
+    _DOC_SUBPROCESS: frozenset = frozenset({
+        # Excludes "run" — appears in nearly all CLI skill docs and kills precision.
+        "execute", "shell", "command", "spawn", "subprocess",
+        "terminal", "cli", "invoke", "launch", "process", "exec",
+    })
+    _DOC_FILE_WRITE: frozenset = frozenset({
+        # Excludes "file"/"create"/"log"/"result" — too generic.
+        "write", "output", "save", "generate", "export", "report",
+    })
+
     # -- Severity penalties for scoring -------------------------------------
 
     _SEVERITY_PENALTIES: Dict[str, int] = {
@@ -577,6 +636,72 @@ class Scanner:
                 r'|wget[^;|]*\|\s*(?:bash|sh)\b'
                 r'|python\s+-c\s+["\']import\s+socket'
                 r'|nc\s+.*-[eElL]',
+                re.IGNORECASE,
+            )
+        if Scanner._SECTION_RE is None:
+            Scanner._SECTION_RE = re.compile(
+                r"^#{1,4}\s+(?:"
+                r"prerequisites?"
+                r"|environment\s+setup"
+                r"|getting\s+started"
+                r"|initial\s+(?:configuration|setup)"
+                r"|first\s+run"
+                r"|quick\s+start"
+                r"|initialization"
+                r"|bootstrap"
+                r"|setup\s+steps?"
+                r"|pre-?install"
+                r")\s*$",
+                re.IGNORECASE,
+            )
+            Scanner._EXEC_REF_RE = re.compile(
+                r"(?:"
+                r"\bpython[23]?\s+\S+\.py\b"
+                r"|\bbash\s+\S+\.sh\b"
+                r"|\bsh\s+\S+\.sh\b"
+                r"|\bsource\s+\S+\.sh\b"
+                r"|`[^`]*\./[^`]*\.(?:sh|py|bash)[^`]*`"
+                r"|\./\S+\.(?:sh|py|bash)\b"
+                r"|\brun\s+\S+\.(?:sh|py|bash)\b"
+                r"|\bexecute\s+\S+\.(?:sh|py|bash)\b"
+                r")",
+                re.IGNORECASE,
+            )
+            Scanner._URGENCY_RE = re.compile(
+                r"(?:"
+                r"^>\s*(?:\*\*)?(?:IMPORTANT|WARNING|CRITICAL|CAUTION|NOTICE|REQUIRED)(?:\*\*)?"
+                r"|\*\*(?:IMPORTANT|WARNING|CRITICAL|CAUTION|REQUIRED)\*\*"
+                r")",
+                re.IGNORECASE,
+            )
+        if Scanner._CAP_NET_RE is None:
+            Scanner._CAP_NET_RE = re.compile(
+                r"(?:https?://[^\s'\"]{2,}"
+                r"|urllib\."
+                r"|requests\.\w"
+                r"|http\.client\b"
+                r"|\bcurl\s+https?://"
+                r"|\bwget\s+https?://"
+                r"|socket\.connect\b"
+                r"|urlopen\b)",
+                re.IGNORECASE,
+            )
+            Scanner._CAP_ENV_RE = re.compile(
+                r"(?:os\.environ\b|os\.getenv\s*\(|process\.env\b|\bgetenv\s*\()",
+                re.IGNORECASE,
+            )
+            Scanner._CAP_EXEC_RE = re.compile(
+                r"(?:subprocess\.\w+\s*\("
+                r"|os\.system\s*\(|os\.popen\s*\("
+                r"|\bexecSync\s*\(|\bspawnSync\s*\(|\bexecFileSync\s*\("
+                r"|\bnew\s+Function\s*\(|\beval\s*\()",
+                re.IGNORECASE,
+            )
+            Scanner._CAP_WRITE_RE = re.compile(
+                r"(?:open\s*\([^)]{0,120}['\"]\s*[wa]\s*['\"]"
+                r"|\.write\s*\("
+                r"|\bshutil\.copy\b|\bshutil\.move\b"
+                r"|fs\.write(?:File)?\s*\(|fs\.append(?:File)?\s*\()",
                 re.IGNORECASE,
             )
 
@@ -653,6 +778,36 @@ class Scanner:
             if fpath.suffix in TEXT_EXTENSIONS:
                 obfuscation_findings.extend(self._scan_obfuscation(fpath, path))
         all_findings.extend(obfuscation_findings)
+
+        # Pass 9: Structural mimicry (.md files only — multi-line context)
+        mimicry_findings = []
+        for fpath in files:
+            if fpath.suffix.lower() == ".md":
+                mimicry_findings.extend(self._scan_structural_mimicry(fpath, path))
+        all_findings.extend(mimicry_findings)
+
+        # Pre-compute shared state for passes 10 and 11 to avoid double file reads.
+        # Read each script file once; both passes consume from this cache.
+        script_cache: Dict[Path, str] = {}
+        for fpath in files:
+            if fpath.suffix.lower() in Scanner._SCRIPT_EXTENSIONS:
+                try:
+                    script_cache[fpath] = fpath.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
+
+        # Locate root-level SKILL.md once (prefer shortest relative path if multiple).
+        skill_doc_candidates = [f for f in files if f.name.lower() == "skill.md"]
+        skill_doc = (
+            min(skill_doc_candidates, key=lambda p: len(p.relative_to(path).parts))
+            if skill_doc_candidates else None
+        )
+
+        # Pass 10: Composite capability co-occurrence (script files + prior findings)
+        all_findings.extend(self._scan_composite(all_findings, script_cache, path))
+
+        # Pass 11: Surplus functionality — capabilities in scripts not in SKILL.md
+        all_findings.extend(self._scan_surplus_functionality(script_cache, skill_doc, path))
 
         # Build summary (deduplicated list for server comparison)
         findings_summary = [
@@ -978,6 +1133,282 @@ class Scanner:
                         "message": message,
                         "context": repr(line.strip()[:80]),
                     })
+
+        return findings
+
+    # -- Pass 9: Structural mimicry (multi-line context, .md files) ----------
+
+    def _scan_structural_mimicry(self, fpath: Path, root: Path) -> List[Dict[str, Any]]:
+        """
+        Detect SkillJect-style structural mimicry: fake section headers in SKILL.md
+        that nudge agents into executing bundled scripts without explicit injection
+        language.  Attacks insert 'Prerequisites' / 'Environment Setup' / 'Getting
+        Started' sections containing script execution directives, and/or urgency
+        markers (bold IMPORTANT blockquotes) adjacent to script references (SS-SM).
+
+        Notes:
+        - `line.strip()` is applied before the `^`-anchored section_re so that
+          indented Markdown headers (a tactic used to evade scanners) are also caught.
+        - SM02 starts the inner search at `i` (the urgency line itself) to catch
+          cases where the urgency marker and the exec reference appear on the same line
+          (e.g. `> **IMPORTANT** run setup.sh`).
+        """
+        findings: List[Dict[str, Any]] = []
+        rel = str(fpath.relative_to(root))
+        assert Scanner._SECTION_RE is not None
+        assert Scanner._EXEC_REF_RE is not None
+        assert Scanner._URGENCY_RE is not None
+
+        try:
+            lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            return findings
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            # Rule SM01: suspicious section header followed by bundled script exec.
+            # strip() before match is intentional — catches indented fake headers.
+            if Scanner._SECTION_RE.match(line.strip()):
+                for j in range(i + 1, min(i + Scanner._SECTION_LOOKAHEAD + 1, len(lines))):
+                    if Scanner._EXEC_REF_RE.search(lines[j]):
+                        findings.append({
+                            "rule_id": "structural_mimicry_section",
+                            "severity": "high",
+                            "file": rel,
+                            "line": j + 1,
+                            "message": (
+                                f"Structural mimicry: script execution inside "
+                                f"'{line.strip()[:60]}' section (SkillJect SS-SM01)"
+                            ),
+                            "context": lines[j].strip()[:120],
+                        })
+                        break  # One finding per section header
+
+            # Rule SM02: urgency marker adjacent to bundled script exec.
+            # Search starts at i (not i+1) to catch same-line urgency+exec combos.
+            if Scanner._URGENCY_RE.search(line):
+                for j in range(i, min(i + Scanner._URGENCY_LOOKAHEAD + 1, len(lines))):
+                    if Scanner._EXEC_REF_RE.search(lines[j]):
+                        findings.append({
+                            "rule_id": "structural_mimicry_urgency",
+                            "severity": "high",
+                            "file": rel,
+                            "line": j + 1,
+                            "message": (
+                                "Structural mimicry: urgency framing adjacent to "
+                                "bundled script execution (SkillJect SS-SM02)"
+                            ),
+                            "context": lines[j].strip()[:120],
+                        })
+                        break  # One finding per urgency marker
+
+            i += 1
+
+        return findings
+
+    # -- Pass 10: Composite capability co-occurrence ------------------------
+
+    def _scan_composite(
+        self,
+        prior_findings: List[Dict[str, Any]],
+        script_cache: Dict[Path, str],
+        root: Path,
+    ) -> List[Dict[str, Any]]:
+        """
+        Detect composite attack patterns by analysing capability co-occurrence
+        within the same file.  SkillJect achieves 95%+ ASR by composing attacks
+        from individually low-severity primitives that defeat threshold-based
+        detection (SS-CP).  Uses the pre-built script_cache to avoid re-reading
+        files already read in earlier passes.
+        """
+        assert Scanner._CAP_NET_RE is not None
+        assert Scanner._CAP_ENV_RE is not None
+        assert Scanner._CAP_EXEC_RE is not None
+        assert Scanner._CAP_WRITE_RE is not None
+
+        findings: List[Dict[str, Any]] = []
+
+        for fpath, content in script_cache.items():
+            rel = str(fpath.relative_to(root))
+
+            has_exec = bool(Scanner._CAP_EXEC_RE.search(content))
+            has_network = bool(Scanner._CAP_NET_RE.search(content))
+            has_env = bool(Scanner._CAP_ENV_RE.search(content))
+            has_write = bool(Scanner._CAP_WRITE_RE.search(content))
+
+            # CP01: process execution + network → potential exfiltration channel
+            if has_exec and has_network:
+                findings.append({
+                    "rule_id": "composite_exec_exfil",
+                    "severity": "critical",
+                    "file": rel,
+                    "line": 0,
+                    "message": (
+                        "Composite: process execution + outbound network in same file "
+                        "— potential data exfiltration channel (SS-CP01)"
+                    ),
+                    "context": "",
+                })
+
+            # CP02: env var read + network (no exec) → credential leak path.
+            # Suppressed when exec is present: CP01 is already critical and covers
+            # the exfiltration vector; adding CP02 would be noise for the same file.
+            if has_env and has_network and not has_exec:
+                findings.append({
+                    "rule_id": "composite_env_leak",
+                    "severity": "high",
+                    "file": rel,
+                    "line": 0,
+                    "message": (
+                        "Composite: environment variable read + outbound network "
+                        "— potential credential exfiltration (SS-CP02)"
+                    ),
+                    "context": "",
+                })
+
+            # CP03: file write + network (no exec, no env) → staged exfiltration.
+            # Suppressed when exec or env is present: those combos produce CP01/CP02
+            # which already capture the higher-severity signal for the same file.
+            if has_write and has_network and not has_exec and not has_env:
+                findings.append({
+                    "rule_id": "composite_write_exfil",
+                    "severity": "high",
+                    "file": rel,
+                    "line": 0,
+                    "message": (
+                        "Composite: file write + outbound network in same file "
+                        "— potential staged exfiltration (SS-CP03)"
+                    ),
+                    "context": "",
+                })
+
+        # CP04: 3+ medium-severity findings in one file → coordinated low-severity attack.
+        # Count medium findings per file in one pass, then emit aggregate findings.
+        medium_counts: Dict[str, int] = {}
+        medium_rule_ids: Dict[str, set] = {}
+        for f in prior_findings:
+            if f.get("severity") == "medium":
+                frel = f["file"]
+                medium_counts[frel] = medium_counts.get(frel, 0) + 1
+                medium_rule_ids.setdefault(frel, set()).add(f["rule_id"])
+
+        for frel, count in medium_counts.items():
+            if count >= 3:
+                findings.append({
+                    "rule_id": "composite_medium_cluster",
+                    "severity": "high",
+                    "file": frel,
+                    "line": 0,
+                    "message": (
+                        f"Composite: {count} medium-severity findings in one file "
+                        f"— review for coordinated low-severity attack (SS-CP04)"
+                    ),
+                    "context": ", ".join(sorted(medium_rule_ids[frel]))[:120],
+                })
+
+        return findings
+
+    # -- Pass 11: Surplus functionality (cross-file doc consistency) ---------
+
+    def _scan_surplus_functionality(
+        self,
+        script_cache: Dict[Path, str],
+        skill_doc: Optional[Path],
+        root: Path,
+    ) -> List[Dict[str, Any]]:
+        """
+        Cross-file consistency check: detect capabilities in bundled scripts that
+        are not documented in SKILL.md.  SkillJect hides malicious payloads in
+        scripts precisely because the documentation says nothing about them — the
+        payload is invoked as an opaque 'helper' step (SS-SF).
+
+        Uses the pre-built script_cache (from scan()) to avoid re-reading files,
+        and accepts the pre-located skill_doc path (root-level preferred) so the
+        SKILL.md search is not repeated per scan.
+        """
+        assert Scanner._CAP_NET_RE is not None
+        assert Scanner._CAP_ENV_RE is not None
+        assert Scanner._CAP_EXEC_RE is not None
+        assert Scanner._CAP_WRITE_RE is not None
+
+        findings: List[Dict[str, Any]] = []
+
+        if skill_doc is None:
+            return findings  # No SKILL.md: can't do cross-modal check
+
+        try:
+            doc_text = skill_doc.read_text(encoding="utf-8", errors="replace").lower()
+        except Exception:
+            return findings
+
+        doc_has_network = any(kw in doc_text for kw in Scanner._DOC_NETWORK)
+        doc_has_env = any(kw in doc_text for kw in Scanner._DOC_ENV)
+        doc_has_subprocess = any(kw in doc_text for kw in Scanner._DOC_SUBPROCESS)
+        doc_has_file_write = any(kw in doc_text for kw in Scanner._DOC_FILE_WRITE)
+
+        for fpath, content in script_cache.items():
+            if fpath == skill_doc:
+                continue
+
+            rel = str(fpath.relative_to(root))
+
+            # SF01: network calls not documented
+            if Scanner._CAP_NET_RE.search(content) and not doc_has_network:
+                findings.append({
+                    "rule_id": "undoc_network",
+                    "severity": "critical",
+                    "file": rel,
+                    "line": 0,
+                    "message": (
+                        "Surplus functionality: script makes outbound network calls "
+                        "but SKILL.md does not document network access (SS-SF01)"
+                    ),
+                    "context": "",
+                })
+
+            # SF02: env var reads not documented
+            if Scanner._CAP_ENV_RE.search(content) and not doc_has_env:
+                findings.append({
+                    "rule_id": "undoc_env_read",
+                    "severity": "high",
+                    "file": rel,
+                    "line": 0,
+                    "message": (
+                        "Surplus functionality: script reads environment variables "
+                        "but SKILL.md does not mention environment or credentials (SS-SF02)"
+                    ),
+                    "context": "",
+                })
+
+            # SF03: subprocess execution not documented
+            if Scanner._CAP_EXEC_RE.search(content) and not doc_has_subprocess:
+                findings.append({
+                    "rule_id": "undoc_subprocess",
+                    "severity": "high",
+                    "file": rel,
+                    "line": 0,
+                    "message": (
+                        "Surplus functionality: script executes subprocesses "
+                        "but SKILL.md does not document command execution (SS-SF03)"
+                    ),
+                    "context": "",
+                })
+
+            # SF04: file writes not documented
+            if Scanner._CAP_WRITE_RE.search(content) and not doc_has_file_write:
+                findings.append({
+                    "rule_id": "undoc_file_write",
+                    "severity": "medium",
+                    "file": rel,
+                    "line": 0,
+                    "message": (
+                        "Surplus functionality: script writes files "
+                        "but SKILL.md does not document file output (SS-SF04)"
+                    ),
+                    "context": "",
+                })
 
         return findings
 
