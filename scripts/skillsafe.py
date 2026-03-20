@@ -3009,7 +3009,8 @@ def cmd_self_update(args: argparse.Namespace) -> None:
     script_path = Path(__file__).resolve()
     base_url = "https://skillsafe.ai"
 
-    print(f"  Current version: {bold(f'v{VERSION}')}")
+    current_hash = hashlib.sha256(script_path.read_bytes()).hexdigest()[-8:]
+    print(f"  Current version: {bold(f'v{VERSION}')} ({current_hash})")
 
     # --- Update skillsafe.py ---
     py_url = f"{base_url}/scripts/skillsafe.py"
@@ -3022,11 +3023,14 @@ def cmd_self_update(args: argparse.Namespace) -> None:
         print(f"\n{red('Error:')} Could not download update: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Compare by content hash (last 8 chars of SHA-256) — no manual version bump needed
+    new_hash = hashlib.sha256(new_src).hexdigest()[-8:]
+
     m = re.search(rb'^VERSION\s*=\s*["\']([^"\']+)["\']', new_src, re.MULTILINE)
     new_version = m.group(1).decode() if m else "unknown"
 
-    if new_version != "unknown" and _parse_semver(new_version) <= _parse_semver(VERSION):
-        print(f"\n{green('Already up to date.')} (v{VERSION})")
+    if current_hash == new_hash:
+        print(f"\n{green('Already up to date.')} (v{VERSION}, {current_hash})")
         script_updated = False
     else:
         tmp = script_path.with_suffix(".py.tmp")
@@ -3036,7 +3040,7 @@ def cmd_self_update(args: argparse.Namespace) -> None:
         except OSError as e:
             print(f"\n{red('Error:')} Could not write update: {e}", file=sys.stderr)
             sys.exit(1)
-        print(f"  {green(f'skillsafe.py: v{VERSION} → v{new_version}')}")
+        print(f"  {green(f'skillsafe.py: v{VERSION} ({current_hash}) → v{new_version} ({new_hash})')}")
         script_updated = True
 
     # --- Update skill definition files ---
