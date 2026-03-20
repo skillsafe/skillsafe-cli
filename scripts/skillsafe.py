@@ -3009,7 +3009,7 @@ def cmd_self_update(args: argparse.Namespace) -> None:
     script_path = Path(__file__).resolve()
     base_url = "https://skillsafe.ai"
 
-    current_hash = hashlib.sha256(script_path.read_bytes()).hexdigest()[-8:]
+    current_hash = hashlib.sha256(script_path.read_bytes()).hexdigest()[-5:]
     print(f"  Current version: {bold(f'v{VERSION}')} ({current_hash})")
 
     # --- Update skillsafe.py ---
@@ -3024,7 +3024,7 @@ def cmd_self_update(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     # Compare by content hash (last 8 chars of SHA-256) — no manual version bump needed
-    new_hash = hashlib.sha256(new_src).hexdigest()[-8:]
+    new_hash = hashlib.sha256(new_src).hexdigest()[-5:]
 
     m = re.search(rb'^VERSION\s*=\s*["\']([^"\']+)["\']', new_src, re.MULTILINE)
     new_version = m.group(1).decode() if m else "unknown"
@@ -4065,7 +4065,7 @@ def _install_to_target(
                     print(dim("  Tip: Use --tool <name> to install directly into a specific agent's directory."))
 
         _write_install_metadata(install_dir, namespace, name, version, tree_hash)
-        _update_lockfile(namespace, name, version, tree_hash)
+    
         return install_dir
 
     skills_dir = _resolve_skills_dir(args)
@@ -4108,7 +4108,7 @@ def _install_to_target(
         print(f"  Location: {install_dir}")
 
     _write_install_metadata(install_dir, namespace, name, version, tree_hash)
-    _update_lockfile(namespace, name, version, tree_hash)
+
     return install_dir
 
 
@@ -4158,7 +4158,7 @@ def _install_to_target_archive(
                     print(dim("  Tip: Use --tool <name> to install directly into a specific agent's directory."))
 
         _write_install_metadata(install_dir, namespace, name, version, tree_hash)
-        _update_lockfile(namespace, name, version, tree_hash)
+    
         return install_dir
 
     skills_dir = _resolve_skills_dir(args)
@@ -4209,7 +4209,7 @@ def _install_to_target_archive(
         print(f"  Location: {install_dir}")
 
     _write_install_metadata(install_dir, namespace, name, version, tree_hash)
-    _update_lockfile(namespace, name, version, tree_hash)
+
     return install_dir
 
 
@@ -5267,69 +5267,6 @@ def _print_scan_results(report: Dict[str, Any], indent: int = 0) -> None:
             print(f"{prefix}           {dim(ctx[:100])}")
 
 
-def _update_lockfile(namespace: str, name: str, version: str, tree_hash: str) -> None:
-    """Update skillsafe.lock in the current working directory (if it exists or cwd is a project).
-
-    Uses advisory file locking (fcntl on Unix) to prevent concurrent installs
-    from losing each other's entries.
-    """
-    lockfile = Path.cwd() / "skillsafe.lock"
-
-    # Advisory file lock to prevent lost-update race with concurrent installs
-    lock_sentinel = lockfile.with_suffix(".lck")
-    lock_fd = None
-    try:
-        import fcntl
-        lock_sentinel.touch(exist_ok=True)
-        lock_fd = open(lock_sentinel, "r")
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-    except (ImportError, OSError):
-        pass  # fcntl unavailable on Windows; proceed without locking
-
-    try:
-        lock_data: Dict[str, Any]
-        if lockfile.exists():
-            with open(lockfile, "r") as f:
-                try:
-                    lock_data = json.load(f)
-                except json.JSONDecodeError:
-                    print("Warning: Lockfile corrupted, starting fresh", file=sys.stderr)
-                    lock_data = {"lockfile_version": 1, "skills": {}}
-        else:
-            # Only create lockfile if there's a recognizable project marker
-            project_markers = ["package.json", "pyproject.toml", "Cargo.toml", "go.mod", ".git"]
-            if not any((Path.cwd() / m).exists() for m in project_markers):
-                return
-            lock_data = {"lockfile_version": 1, "skills": {}}
-
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        lock_data.setdefault("skills", {})[f"@{namespace}/{name}"] = {
-            "version": version,
-            "tree_hash": tree_hash,
-            "installed_at": now,
-        }
-
-        # Atomic write via temp file + os.replace to avoid corruption on crash
-        fd, tmp_path = tempfile.mkstemp(dir=str(lockfile.parent), suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(lock_data, f, indent=2)
-                f.write("\n")
-            os.replace(tmp_path, str(lockfile))
-        except BaseException:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-    finally:
-        if lock_fd is not None:
-            try:
-                import fcntl
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except (ImportError, OSError):
-                pass
-            lock_fd.close()
 
 
 # ---------------------------------------------------------------------------
