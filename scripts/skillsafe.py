@@ -10,6 +10,7 @@ Usage:
     python skillsafe.py init [path]                       # create skillsafe.yaml wizard
     python skillsafe.py auth                              # browser login
     python skillsafe.py scan <path>
+    python skillsafe.py bom <path> [-o bom.json]
     python skillsafe.py save <path> --version <ver> [--description <d>] [--category <c>] [--tags <t>]
     python skillsafe.py share <@namespace/skill> --version <ver> [--public] [--expires <1d|7d|30d|never>]
     python skillsafe.py install <@namespace/skill> [--version <ver>] [--tool <name>] [--location project|global] [--skills-dir <override>]
@@ -376,7 +377,7 @@ class Scanner:
     """
     Security scanner for skill directories.
 
-    Performs eleven scan passes:
+    Performs twelve scan passes:
       1. Python static analysis (AST-based)
       2. JavaScript / TypeScript static analysis (regex-based)
       3. Secret detection (regex on all text files)
@@ -388,6 +389,7 @@ class Scanner:
       9. Structural mimicry detection (multi-line context scan on .md files)
      10. Composite capability co-occurrence (exec+network, env+network, clusters)
      11. Surplus functionality (script capabilities not documented in SKILL.md)
+     12. BOM (Bill of Materials) — neutral capability inventory
     """
 
     # -- Dangerous Python function patterns (AST-based) ---------------------
@@ -593,6 +595,28 @@ class Scanner:
         "write", "output", "save", "generate", "export", "report",
     })
 
+    # -- Pass 12: BOM (Bill of Materials) regex patterns --------------------
+    # Neutral inventory extraction — not security findings.
+
+    _BOM_URL_RE: Optional[re.Pattern] = None
+    _BOM_OPEN_RE: Optional[re.Pattern] = None
+    _BOM_ENV_RE: Optional[re.Pattern] = None
+    _BOM_IMPORT_RE: Optional[re.Pattern] = None
+    _BOM_JS_REQUIRE_RE: Optional[re.Pattern] = None
+    _BOM_BINARY_RE: Optional[re.Pattern] = None
+    _BOM_FS_DELETE_RE: Optional[re.Pattern] = None
+    _BOM_FS_WRITE_RE: Optional[re.Pattern] = None
+
+    # Well-known CLI tool names for binary detection
+    _BOM_KNOWN_BINARIES: frozenset = frozenset({
+        "git", "docker", "ffmpeg", "npm", "npx", "pip", "pip3", "cargo",
+        "make", "cmake", "gcc", "g++", "clang", "rustc", "go", "java",
+        "javac", "ruby", "perl", "php", "wget", "curl", "ssh", "scp",
+        "rsync", "tar", "zip", "unzip", "gzip", "7z", "jq", "yq",
+        "kubectl", "helm", "terraform", "ansible", "vagrant", "brew",
+        "apt", "apt-get", "yum", "dnf", "pacman", "snap", "flatpak",
+    })
+
     # -- Severity penalties for scoring -------------------------------------
 
     _SEVERITY_PENALTIES: Dict[str, int] = {
@@ -704,6 +728,38 @@ class Scanner:
                 r"|fs\.write(?:File)?\s*\(|fs\.append(?:File)?\s*\()",
                 re.IGNORECASE,
             )
+        # -- BOM (Pass 12) patterns --
+        if Scanner._BOM_URL_RE is None:
+            Scanner._BOM_URL_RE = re.compile(r"https?://[^\s'\")\]>]+")
+            Scanner._BOM_OPEN_RE = re.compile(
+                r"""open\s*\(\s*(['"])(.*?)\1(?:\s*,\s*(['"])(.*?)\3)?""",
+            )
+            Scanner._BOM_ENV_RE = re.compile(
+                r"(?:os\.getenv\s*\(\s*['\"](\w+)['\"]"
+                r"|os\.environ(?:\[|\.\w+\s*\(\s*)['\"](\w+)['\"]"
+                r"|process\.env\.(\w+))",
+            )
+            Scanner._BOM_IMPORT_RE = re.compile(
+                r"^\s*(?:import\s+([\w.]+)|from\s+([\w.]+)\s+import)",
+                re.MULTILINE,
+            )
+            Scanner._BOM_JS_REQUIRE_RE = re.compile(
+                r"""(?:require\s*\(\s*['"]([\w@/.-]+)['"]|import\s+.*?\bfrom\s+['"]([\w@/.-]+)['"])""",
+            )
+            Scanner._BOM_BINARY_RE = re.compile(
+                r"(?:^|[;\s|&`$()])\b(" + "|".join(re.escape(b) for b in sorted(Scanner._BOM_KNOWN_BINARIES)) + r")\b",
+            )
+            Scanner._BOM_FS_DELETE_RE = re.compile(
+                r"(?:os\.remove\s*\(|os\.unlink\s*\(|shutil\.rmtree\s*\("
+                r"|fs\.unlinkSync\s*\(|fs\.rmdirSync\s*\(|fs\.rmSync\s*\("
+                r"|\brm\s+-[rRf])",
+                re.IGNORECASE,
+            )
+            Scanner._BOM_FS_WRITE_RE = re.compile(
+                r"(?:fs\.(?:writeFileSync|writeFile|appendFileSync|appendFile)\s*\(\s*['\"]([^'\"]+)['\"]"
+                r"|(?:echo|cat|printf)\s+.*>\s*([a-zA-Z][\w./\-]*))",
+                re.IGNORECASE,
+            )
 
     # -- Public API ---------------------------------------------------------
 
@@ -809,6 +865,9 @@ class Scanner:
         # Pass 11: Surplus functionality — capabilities in scripts not in SKILL.md
         all_findings.extend(self._scan_surplus_functionality(script_cache, skill_doc, path))
 
+        # Pass 12: BOM (Bill of Materials) — neutral capability inventory
+        bom = self._generate_bom(files, script_cache, path)
+
         # Build summary (deduplicated list for server comparison)
         findings_summary = [
             {"rule_id": f["rule_id"], "severity": f["severity"], "file": f["file"], "line": f["line"], "message": f["message"]}
@@ -820,7 +879,7 @@ class Scanner:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         report: Dict[str, Any] = {
-            "schema_version": "1.0",
+            "schema_version": "1.1",
             "scanner": {
                 "tool": SCANNER_TOOL,
                 "version": VERSION,
@@ -835,6 +894,7 @@ class Scanner:
         }
         if tree_hash:
             report["skill_tree_hash"] = tree_hash
+        report["bom"] = bom
 
         return report
 
@@ -1411,6 +1471,225 @@ class Scanner:
                 })
 
         return findings
+
+    # -- Pass 12: BOM (Bill of Materials) generation ------------------------
+
+    def _generate_bom(
+        self,
+        files: List[Path],
+        script_cache: Dict[Path, str],
+        root: Path,
+    ) -> Dict[str, Any]:
+        """Generate a neutral Bill of Materials inventory from scanned files."""
+        assert Scanner._BOM_URL_RE is not None
+        assert Scanner._BOM_ENV_RE is not None
+
+        file_reads: List[Dict[str, Any]] = []
+        file_writes: List[Dict[str, Any]] = []
+        file_deletes: List[Dict[str, Any]] = []
+        urls_list: List[Dict[str, Any]] = []
+        env_vars: List[Dict[str, Any]] = []
+        binaries: List[Dict[str, Any]] = []
+        system_commands: List[Dict[str, Any]] = []
+        py_imports: set = set()
+        js_requires: set = set()
+        shell_tools: set = set()
+        files_with_caps: set = set()
+
+        all_content: Dict[Path, str] = {}
+        # Use script_cache + read remaining text files
+        for fpath in files:
+            if fpath in script_cache:
+                all_content[fpath] = script_cache[fpath]
+            elif fpath.suffix.lower() in TEXT_EXTENSIONS:
+                try:
+                    all_content[fpath] = fpath.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
+
+        for fpath, content in all_content.items():
+            rel = str(fpath.relative_to(root))
+            lines = content.splitlines()
+            has_cap = False
+            is_py = fpath.suffix.lower() == ".py"
+            is_js = fpath.suffix.lower() in (".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx")
+
+            for line_no, line in enumerate(lines, 1):
+                # URL extraction
+                for m in Scanner._BOM_URL_RE.finditer(line):
+                    url = m.group(0).rstrip(".,;:)")
+                    urls_list.append({"file": rel, "line": line_no, "url": url})
+                    has_cap = True
+
+                # open() calls — classify as read or write
+                for m in Scanner._BOM_OPEN_RE.finditer(line):
+                    target = m.group(2)
+                    mode = m.group(4) or "r"
+                    entry = {"file": rel, "line": line_no, "pattern": line.strip()[:120], "target": target}
+                    if any(c in mode for c in "wax"):
+                        file_writes.append(entry)
+                    else:
+                        file_reads.append(entry)
+                    has_cap = True
+
+                # Env var extraction
+                for m in Scanner._BOM_ENV_RE.finditer(line):
+                    name = m.group(1) or m.group(2) or m.group(3)
+                    if name:
+                        env_vars.append({"file": rel, "line": line_no, "name": name, "usage": line.strip()[:120]})
+                        has_cap = True
+
+                # Binary / CLI tool detection
+                for m in Scanner._BOM_BINARY_RE.finditer(line):
+                    bin_name = m.group(1)
+                    binaries.append({"file": rel, "line": line_no, "name": bin_name, "context": line.strip()[:120]})
+                    shell_tools.add(bin_name)
+                    has_cap = True
+
+                # File delete detection
+                if Scanner._BOM_FS_DELETE_RE.search(line):
+                    file_deletes.append({"file": rel, "line": line_no, "pattern": line.strip()[:120]})
+                    has_cap = True
+
+                # File write detection (non-open patterns: fs.writeFile, shell >)
+                fs_write_m = Scanner._BOM_FS_WRITE_RE.search(line)
+                if fs_write_m:
+                    target = fs_write_m.group(1) or fs_write_m.group(2) or ""
+                    file_writes.append({"file": rel, "line": line_no, "pattern": line.strip()[:120], "target": target})
+                    has_cap = True
+
+                # System commands (subprocess / exec patterns)
+                if Scanner._CAP_EXEC_RE and Scanner._CAP_EXEC_RE.search(line):
+                    system_commands.append({"file": rel, "line": line_no, "command": line.strip()[:120]})
+                    has_cap = True
+
+            # Python imports
+            if is_py:
+                for m in Scanner._BOM_IMPORT_RE.finditer(content):
+                    mod = m.group(1) or m.group(2)
+                    if mod:
+                        py_imports.add(mod.split(".")[0])
+
+            # JS requires/imports
+            if is_js:
+                for m in Scanner._BOM_JS_REQUIRE_RE.finditer(content):
+                    mod = m.group(1) or m.group(2)
+                    if mod:
+                        js_requires.add(mod.split("/")[0].lstrip("@") if mod.startswith("@") else mod)
+
+            if has_cap:
+                files_with_caps.add(rel)
+
+        # Deduplicate URLs → extract domains and protocols
+        seen_urls: set = set()
+        unique_urls: List[Dict[str, Any]] = []
+        all_domains: set = set()
+        all_protocols: set = set()
+        for u in urls_list:
+            url_val = u["url"]
+            if url_val not in seen_urls:
+                seen_urls.add(url_val)
+                unique_urls.append(u)
+            try:
+                parsed = urllib.parse.urlparse(url_val)
+                if parsed.hostname:
+                    all_domains.add(parsed.hostname)
+                if parsed.scheme:
+                    all_protocols.add(parsed.scheme)
+            except Exception:
+                pass
+
+        # Build capabilities list
+        capabilities_used: List[str] = []
+        cap_counts: Dict[str, int] = {}
+        if unique_urls:
+            capabilities_used.append("network_access")
+            cap_counts["network"] = len(unique_urls)
+        if file_reads or file_writes or file_deletes:
+            capabilities_used.append("file_access")
+            cap_counts["file_access"] = len(file_reads) + len(file_writes) + len(file_deletes)
+        if env_vars:
+            capabilities_used.append("env_read")
+            cap_counts["env_read"] = len(env_vars)
+        if system_commands:
+            capabilities_used.append("subprocess_exec")
+            cap_counts["subprocess"] = len(system_commands)
+        if file_writes:
+            capabilities_used.append("file_write")
+
+        # Risk surface
+        n_caps = len(capabilities_used)
+        if n_caps == 0:
+            risk = "none"
+        elif n_caps == 1:
+            risk = "low"
+        elif n_caps <= 3:
+            risk = "medium"
+        else:
+            risk = "high"
+
+        # Data flow
+        inputs: List[Dict[str, str]] = []
+        outputs: List[Dict[str, str]] = []
+        seen_inputs: set = set()
+        for ev in env_vars:
+            key = ("env_var", ev["name"])
+            if key not in seen_inputs:
+                seen_inputs.add(key)
+                inputs.append({"type": "env_var", "name": ev["name"]})
+        for fr in file_reads:
+            key = ("file_read", fr.get("target", ""))
+            if key not in seen_inputs and fr.get("target"):
+                seen_inputs.add(key)
+                inputs.append({"type": "file_read", "path": fr["target"]})
+        seen_outputs: set = set()
+        for fw in file_writes:
+            t = fw.get("target", "")
+            if t and ("file_write", t) not in seen_outputs:
+                seen_outputs.add(("file_write", t))
+                outputs.append({"type": "file_write", "path": t})
+        for d in sorted(all_domains):
+            outputs.append({"type": "network", "domain": d})
+
+        bom: Dict[str, Any] = {
+            "schema_version": "1.0",
+            "file_access": {
+                "reads": file_reads,
+                "writes": file_writes,
+                "deletes": file_deletes,
+                "creates": [],
+            },
+            "network": {
+                "urls": unique_urls,
+                "domains": sorted(all_domains),
+                "protocols": sorted(all_protocols),
+            },
+            "environment": {
+                "env_vars": env_vars,
+                "binaries": binaries,
+                "system_commands": system_commands,
+            },
+            "permissions": {
+                "capabilities_used": capabilities_used,
+                "risk_surface": risk,
+            },
+            "data_flow": {
+                "inputs": inputs,
+                "outputs": outputs,
+            },
+            "dependencies": {
+                "python_imports": sorted(py_imports),
+                "js_requires": sorted(js_requires),
+                "shell_tools": sorted(shell_tools),
+            },
+            "summary": {
+                "total_files_scanned": len(files),
+                "files_with_capabilities": len(files_with_caps),
+                "capability_count": cap_counts,
+                "risk_surface": risk,
+            },
+        }
+        return bom
 
     # -- Scoring ------------------------------------------------------------
 
@@ -3011,6 +3290,80 @@ def cmd_scan(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
             sys.exit(1)
 
     return report
+
+
+def _print_bom(bom: Dict[str, Any]) -> None:
+    """Pretty-print BOM summary to terminal."""
+    summary = bom.get("summary", {})
+    risk = summary.get("risk_surface", "none")
+    risk_colors = {"none": green, "low": green, "medium": yellow, "high": red}
+    risk_fn = risk_colors.get(risk, str)
+
+    print(f"\n{bold('Bill of Materials (BOM)')}")
+    print(f"  Files scanned:     {summary.get('total_files_scanned', 0)}")
+    print(f"  With capabilities: {summary.get('files_with_capabilities', 0)}")
+    print(f"  Risk surface:      {risk_fn(risk.upper())}\n")
+
+    caps = summary.get("capability_count", {})
+    if caps:
+        print(f"  {bold('Capabilities:')}")
+        for cap, count in caps.items():
+            print(f"    {cap:<16} {count}")
+        print()
+
+    # Network
+    net = bom.get("network", {})
+    domains = net.get("domains", [])
+    if domains:
+        print(f"  {bold('Domains:')} {', '.join(domains)}")
+
+    # Env vars
+    env = bom.get("environment", {})
+    env_names = sorted({e["name"] for e in env.get("env_vars", [])})
+    if env_names:
+        print(f"  {bold('Env vars:')} {', '.join(env_names)}")
+
+    # Dependencies
+    deps = bom.get("dependencies", {})
+    for dep_type, label in [("python_imports", "Python"), ("js_requires", "JS"), ("shell_tools", "Shell")]:
+        items = deps.get(dep_type, [])
+        if items:
+            print(f"  {bold(f'{label} deps:')} {', '.join(items)}")
+
+    print()
+
+
+def cmd_bom(args: argparse.Namespace) -> None:
+    """Generate and display BOM for a skill directory."""
+    path = Path(args.path).resolve()
+    if not path.is_dir():
+        print(f"Error: {path} is not a directory.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Generating BOM for {bold(str(path))}...\n")
+    scanner = Scanner()
+
+    try:
+        report = scanner.scan(path)
+    except ScanError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    bom = report.get("bom", {})
+    if not bom:
+        print("No BOM data generated.")
+        return
+
+    _print_bom(bom)
+
+    # Optionally write BOM JSON to file
+    out_path = getattr(args, "output", None)
+    if out_path:
+        out_path = Path(out_path)
+        with open(out_path, "w") as f:
+            json.dump(bom, f, indent=2)
+            f.write("\n")
+        print(f"BOM written to {out_path}")
 
 
 def cmd_save(args: argparse.Namespace) -> None:
@@ -4847,6 +5200,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_scan.add_argument("--check", action="store_true", help="Exit with code 1 if any HIGH or CRITICAL findings exist (CI mode)")
     p_scan.add_argument("--ignore", metavar="RULES", help="Comma-separated rule IDs to suppress (e.g. git_hook_persist,unpinned_npm)")
 
+    # -- bom ----------------------------------------------------------------
+    p_bom = subparsers.add_parser("bom", help="Generate Bill of Materials for a skill directory")
+    p_bom.add_argument("path", help="Path to the skill directory")
+    p_bom.add_argument("-o", "--output", help="Write BOM JSON to file")
+
     # -- save ---------------------------------------------------------------
     p_save = subparsers.add_parser("save", help="Save a skill to the registry (private by default)")
     p_save.add_argument("path", help="Path to the skill directory")
@@ -4987,6 +5345,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         cmd_auth(args)
     elif args.command == "scan":
         cmd_scan(args)
+    elif args.command == "bom":
+        cmd_bom(args)
     elif args.command == "save":
         cmd_save(args)
     elif args.command == "share":
