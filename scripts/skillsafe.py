@@ -180,6 +180,8 @@ TOOL_PROJECT_SKILLS_SUBDIRS: Dict[str, str] = {
     "kilo": ".kilocode/skills",
 }
 
+CANONICAL_SKILLS_SUBDIR = ".agents/skills"
+
 MAX_ARCHIVE_SIZE = 10 * 1024 * 1024  # 10 MB
 
 # Binary file extensions that should not be bundled in skills
@@ -3645,7 +3647,8 @@ def cmd_install(args: argparse.Namespace) -> None:
     elif "/share/shr_" in skill_ref:
         share_id = skill_ref.split("/share/")[-1].split("?")[0]
 
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+    api_key = cfg.get("api_key")
+    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=api_key)
 
     # ---------- Download ----------
 
@@ -3724,7 +3727,7 @@ def cmd_install(args: argparse.Namespace) -> None:
         if not version:
             print(f"Resolving latest version of {bold(f'@{namespace}/{name}')}...")
             try:
-                meta = client.get_metadata(namespace, name, auth=True)
+                meta = client.get_metadata(namespace, name, auth=bool(api_key))
                 version = meta.get("latest_version", "")
                 if not version:
                     print("Error: No published versions found.", file=sys.stderr)
@@ -3746,7 +3749,10 @@ def cmd_install(args: argparse.Namespace) -> None:
         try:
             dl_format, dl_data = client.download(namespace, name, version)
         except SkillSafeError as e:
-            print(f"  Error: {e.message}", file=sys.stderr)
+            if e.status in (401, 403) and not api_key:
+                print("  Error: This skill may be private. Run 'skillsafe auth' to sign in.", file=sys.stderr)
+            else:
+                print(f"  Error: {e.message}", file=sys.stderr)
             sys.exit(1)
 
         if dl_format == "files":
@@ -3834,6 +3840,10 @@ def cmd_install(args: argparse.Namespace) -> None:
 
         # Install to final location (from archive)
         _install_to_target_archive(args, namespace, name, version, local_tree_hash, archive_bytes)
+
+    # Hint for unauthenticated users
+    if not api_key:
+        print(dim("\n  Tip: Run 'skillsafe auth' to enable dual-side verification on future installs."))
 
 
 def _submit_verification(
@@ -3993,7 +4003,6 @@ def _install_to_target(
     source_dir: Path,
 ) -> Path:
     """Copy files from source_dir to the final install location. Returns install_dir."""
-    skills_dir = _resolve_skills_dir(args)
 
     def _safe_copytree(src: Path, dst: Path) -> None:
         """Copy tree from src to dst, skipping any symlinks for safety."""
@@ -4018,6 +4027,44 @@ def _install_to_target(
                 shutil.copytree(item, target, symlinks=False)
             else:
                 shutil.copy2(item, target)
+
+    # Canonical mode: install to .agents/skills/<name>/ and symlink to detected agents
+    if _should_use_canonical_mode(args):
+        canonical_base = Path.cwd() / CANONICAL_SKILLS_SUBDIR
+        install_dir = canonical_base / name
+        try:
+            install_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(install_dir, 0o700)
+            except OSError:
+                pass
+            print(f"\n  Installing to {install_dir}...")
+            _safe_copytree(source_dir, install_dir)
+            print(green(f"\n  \u2713 Installed @{namespace}/{name}@{version}"))
+            print(f"  Location: {install_dir}")
+        except (PermissionError, OSError) as e:
+            print(red(f"\n  Error: could not install to {install_dir}: {e}"), file=sys.stderr)
+            raise
+
+        # Create symlinks unless --no-symlink
+        if not getattr(args, "no_symlink", False):
+            created = _create_agent_symlinks(canonical_base, name, Path.cwd())
+            if created:
+                print(f"\n  Symlinked to {len(created)} agent(s):")
+                for tool_key, link_path in created:
+                    label = TOOL_DISPLAY_NAMES.get(tool_key, tool_key)
+                    print(f"    {label}: {link_path}")
+            else:
+                agents = _detect_agent_dirs(Path.cwd())
+                if not agents:
+                    print(dim("\n  No agent config directories detected in this project."))
+                    print(dim("  Tip: Use --tool <name> to install directly into a specific agent's directory."))
+
+        _write_install_metadata(install_dir, namespace, name, version, tree_hash)
+        _update_lockfile(namespace, name, version, tree_hash)
+        return install_dir
+
+    skills_dir = _resolve_skills_dir(args)
 
     if skills_dir:
         install_dir = skills_dir / name
@@ -4070,6 +4117,46 @@ def _install_to_target_archive(
     archive_bytes: bytes,
 ) -> Path:
     """Extract a v1 archive to the final install location. Returns install_dir."""
+
+    # Canonical mode: install to .agents/skills/<name>/ and symlink to detected agents
+    if _should_use_canonical_mode(args):
+        canonical_base = Path.cwd() / CANONICAL_SKILLS_SUBDIR
+        install_dir = canonical_base / name
+        try:
+            if install_dir.exists():
+                shutil.rmtree(install_dir)
+            install_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(install_dir, 0o700)
+            except OSError:
+                pass
+            print(f"\n  Installing to {install_dir}...")
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
+                _safe_extractall(tar, install_dir)
+            print(green(f"\n  \u2713 Installed @{namespace}/{name}@{version}"))
+            print(f"  Location: {install_dir}")
+        except (PermissionError, OSError) as e:
+            print(red(f"\n  Error: could not install to {install_dir}: {e}"), file=sys.stderr)
+            raise
+
+        # Create symlinks unless --no-symlink
+        if not getattr(args, "no_symlink", False):
+            created = _create_agent_symlinks(canonical_base, name, Path.cwd())
+            if created:
+                print(f"\n  Symlinked to {len(created)} agent(s):")
+                for tool_key, link_path in created:
+                    label = TOOL_DISPLAY_NAMES.get(tool_key, tool_key)
+                    print(f"    {label}: {link_path}")
+            else:
+                agents = _detect_agent_dirs(Path.cwd())
+                if not agents:
+                    print(dim("\n  No agent config directories detected in this project."))
+                    print(dim("  Tip: Use --tool <name> to install directly into a specific agent's directory."))
+
+        _write_install_metadata(install_dir, namespace, name, version, tree_hash)
+        _update_lockfile(namespace, name, version, tree_hash)
+        return install_dir
+
     skills_dir = _resolve_skills_dir(args)
 
     if skills_dir:
@@ -5016,6 +5103,99 @@ def cmd_claim(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _should_use_canonical_mode(args: argparse.Namespace) -> bool:
+    """Return True when install should use the canonical .agents/skills/ directory with symlinks."""
+    if getattr(args, "skills_dir", None):
+        return False
+    if getattr(args, "tool", None):
+        return False
+    location = getattr(args, "location", None) or "project"
+    return location == "project"
+
+
+# Agent config directories to detect (relative to project root).
+# Maps tool_key → (config_dir_to_detect, project_skills_subdir).
+# "codex" is excluded because .agents/skills IS the canonical dir.
+_AGENT_DETECT_MAP: Dict[str, Tuple[str, str]] = {
+    "claude":      (".claude",                  ".claude/skills"),
+    "cursor":      (".cursor",                  ".cursor/skills"),
+    "windsurf":    (".windsurf",                ".windsurf/skills"),
+    "gemini":      (".gemini",                  ".gemini/skills"),
+    "cline":       (".cline",                   ".cline/skills"),
+    "roo":         (".roo",                     ".roo/skills"),
+    "goose":       (".goose",                   ".goose/skills"),
+    "copilot":     (".github/copilot",          ".github/copilot/skills"),
+    "kiro":        (".kiro",                    ".kiro/skills"),
+    "trae":        (".trae",                    ".trae/skills"),
+    "amp":         (".amp",                     ".amp/skills"),
+    "aider":       (".aider",                   ".aider/skills"),
+    "antigravity": (".gemini/antigravity",      ".agent/skills"),
+    "droid":       (".factory",                 ".factory/skills"),
+    "kilo":        (".kilocode",                ".kilocode/skills"),
+}
+
+
+def _detect_agent_dirs(root: Path) -> List[Tuple[str, Path]]:
+    """Scan root for known agent config directories.
+
+    Returns list of (tool_name, project_skills_path) for agents whose config dir exists.
+    """
+    found: List[Tuple[str, Path]] = []
+    for tool_key, (config_dir, skills_subdir) in _AGENT_DETECT_MAP.items():
+        config_path = root / config_dir
+        if config_path.is_dir():
+            found.append((tool_key, root / skills_subdir))
+    return found
+
+
+def _create_agent_symlinks(
+    canonical_dir: Path,
+    skill_name: str,
+    root: Path,
+) -> List[Tuple[str, Path]]:
+    """Create relative symlinks from each detected agent's skills dir to the canonical dir.
+
+    Returns list of (tool_name, symlink_path) for successfully created symlinks.
+    """
+    agents = _detect_agent_dirs(root)
+    created: List[Tuple[str, Path]] = []
+    for tool_key, skills_path in agents:
+        link_path = skills_path / skill_name
+        target = canonical_dir / skill_name
+
+        # Real directory exists — skip, don't modify other agents' directories
+        if link_path.exists() and not link_path.is_symlink():
+            label = TOOL_DISPLAY_NAMES.get(tool_key, tool_key)
+            print(f"    {label}: skipped (existing install at {link_path})")
+            print(f"      To update: skillsafe install @<ns>/<name> --tool {tool_key}")
+            continue
+
+        try:
+            skills_path.mkdir(parents=True, exist_ok=True)
+            # Compute relative path for portability
+            rel_target = os.path.relpath(target, link_path.parent)
+
+            # Remove existing symlink to update it
+            if link_path.is_symlink():
+                link_path.unlink()
+
+            link_path.symlink_to(rel_target)
+            created.append((tool_key, link_path))
+        except OSError as e:
+            label = TOOL_DISPLAY_NAMES.get(tool_key, tool_key)
+            if sys.platform == "win32":
+                # Copy instead of symlink on Windows (symlinks require Developer Mode)
+                try:
+                    shutil.copytree(target, link_path, symlinks=False)
+                    created.append((tool_key, link_path))
+                except OSError as copy_err:
+                    print(f"    {label}: copy failed ({copy_err})")
+            else:
+                print(f"    {label}: symlink failed ({e})")
+
+    return created
+
+
 def _resolve_skills_dir(args: argparse.Namespace) -> Optional[Path]:
     """
     Resolve the target skills directory from CLI flags.
@@ -5165,7 +5345,8 @@ def main(argv: Optional[List[str]] = None) -> None:
               skillsafe save ./my-skill --version 1.0.0
               skillsafe share @alice/my-skill --version 1.0.0
               skillsafe share @alice/my-skill --version 1.0.0 --public
-              skillsafe install @alice/my-skill                                    # current folder (default)
+              skillsafe install @alice/my-skill                                    # .agents/skills/ + symlinks (default)
+              skillsafe install @alice/my-skill --no-symlink                     # .agents/skills/ only, no symlinks
               skillsafe install @alice/my-skill --tool claude                     # .claude/skills/ in current project
               skillsafe install @alice/my-skill --tool claude --location global   # global ~/.claude/skills/
               skillsafe install @alice/my-skill --tool cursor --location global   # global ~/.cursor/skills/
@@ -5231,6 +5412,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_install.add_argument("--location", choices=["project", "global"], default="project",
         help="Install location: project = tool's subdir in current folder (default), global = tool's global skills dir")
     p_install.add_argument("--skills-dir", help="Override install path directly (ignores --tool and --location)")
+    p_install.add_argument("--no-symlink", action="store_true", help="Install to .agents/skills/ without creating agent symlinks")
 
     # -- search -------------------------------------------------------------
     p_search = subparsers.add_parser("search", help="Search for skills")

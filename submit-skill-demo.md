@@ -12,7 +12,7 @@ clearly. It appears on `https://skillsafe.ai/demos/` and on the skill's detail p
 2. Fetch the skill's info and install it to read its SKILL.md:
    ```bash
    python3 <skill-dir>/scripts/skillsafe.py info @namespace/skill-name
-   python3 <skill-dir>/scripts/skillsafe.py install @namespace/skill-name --tool claude
+   python3 <skill-dir>/scripts/skillsafe.py install @namespace/skill-name
    ```
 3. Read the installed `SKILL.md` to understand the skill's capabilities and workflows.
 4. Get the SkillSafe API key:

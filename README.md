@@ -22,7 +22,7 @@ python3 scripts/skillsafe.py save <path> --version 1.0.0
 python3 scripts/skillsafe.py share @ns/name --version 1.0.0
 
 # Install a skill
-python3 scripts/skillsafe.py install @ns/name --tool claude
+python3 scripts/skillsafe.py install @ns/name
 
 # Search the registry
 python3 scripts/skillsafe.py search "code review"
