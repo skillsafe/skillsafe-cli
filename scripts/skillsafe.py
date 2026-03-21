@@ -3865,8 +3865,11 @@ def _submit_verification(
         if e.status in (401, 403):
             print("  Verification skipped (sign in with 'skillsafe auth' to enable dual-side verification).")
             return "skipped", {}
+        elif e.status == 404 or "no publisher" in e.message.lower():
+            print("  Verification skipped (no publisher scan report for this version).")
+            return "skipped", {}
         else:
-            print(f"  Warning: Verification failed due to error: {e.message}", file=sys.stderr)
+            print(f"  Warning: Verification failed: {e.message}", file=sys.stderr)
             print("  Continuing without verification.", file=sys.stderr)
             return "error", {}
 
