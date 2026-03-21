@@ -3,3 +3,7 @@ __pycache__/
 .pytest_cache/
 .skillsafe.json
 tests/
+.agents/
+.claude/
+.cursor/
+.windsurf/
