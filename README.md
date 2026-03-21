@@ -150,14 +150,7 @@ SKILL.md                   # Skill definition (source of truth)
 scripts/skillsafe.py       # CLI client (stdlib only, single file)
 submit-skill-demo.md       # Instructions for AI-assisted demo recording
 submit-demo-comment.md     # Instructions for AI-assisted demo commenting
-tests/test_skillsafe.py    # Test suite
 LICENSE                    # MIT
-```
-
-## Testing
-
-```bash
-python3 -m pytest tests/ -v
 ```
 
 ## License
