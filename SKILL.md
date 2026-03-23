@@ -275,7 +275,7 @@ python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name> --version <
 
 ## Self-Improving Skills
 
-Skills can self-improve based on usage feedback. When a skill has `improvable: true` in its frontmatter, the main agent orchestrates an observe-improve-save loop after each execution.
+Skills can self-improve based on usage feedback. When a skill has `improvable: true` in its frontmatter, the main agent orchestrates an observe-improve-save loop after each execution. Self-improvement is disabled by default — pass `--auto-improve` during install to opt in.
 
 ### Frontmatter Fields
 
@@ -292,7 +292,7 @@ allowed-tools: Bash, Read, Write
 ---
 ```
 
-- **`improvable: true`** — Signals that this skill opts into the self-improvement loop. When present, the main agent observes execution and user feedback, then edits and saves a new version when warranted.
+- **`improvable: true`** — Signals that this skill opts into the self-improvement loop. When present, the main agent observes execution and user feedback, then edits and saves a new version when warranted. Not injected by default — pass `--auto-improve` during install to enable.
 - **`registry: "@ns/name"`** — The skill's registry coordinates. Used by the auto-save flow so the agent doesn't need to derive namespace and name separately. Read from `.skillsafe.json` if not in frontmatter.
 - **`context: fork`** — Skills should run in a sub-agent (separate context) so the main agent can observe the full execution and user reaction without being inside the skill's execution flow.
 

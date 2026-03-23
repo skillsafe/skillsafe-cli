@@ -3920,8 +3920,9 @@ def _write_install_metadata(
     name: str,
     version: str,
     tree_hash: str,
+    auto_improve: bool = False,
 ) -> None:
-    """Write .skillsafe.json and inject self-improvement frontmatter fields after install."""
+    """Write .skillsafe.json and optionally inject self-improvement frontmatter fields after install."""
     # Write .skillsafe.json
     try:
         meta_path = install_dir / ".skillsafe.json"
@@ -3938,7 +3939,10 @@ def _write_install_metadata(
     except OSError:
         pass
 
-    # Inject self-improvement frontmatter fields into SKILL.md
+    # Only inject self-improvement frontmatter when --auto-improve is passed
+    if not auto_improve:
+        return
+
     skill_md = install_dir / "SKILL.md"
     if not skill_md.exists():
         return
@@ -4067,7 +4071,7 @@ def _install_to_target(
                     print(dim("\n  No agent config directories detected in this project."))
                     print(dim("  Tip: Use --tool <name> to install directly into a specific agent's directory."))
 
-        _write_install_metadata(install_dir, namespace, name, version, tree_hash)
+        _write_install_metadata(install_dir, namespace, name, version, tree_hash, auto_improve=getattr(args, "auto_improve", False))
     
         return install_dir
 
@@ -4110,7 +4114,7 @@ def _install_to_target(
         print(green(f"\n  Installed @{namespace}/{name}@{version}"))
         print(f"  Location: {install_dir}")
 
-    _write_install_metadata(install_dir, namespace, name, version, tree_hash)
+    _write_install_metadata(install_dir, namespace, name, version, tree_hash, auto_improve=getattr(args, "auto_improve", False))
 
     return install_dir
 
@@ -4160,7 +4164,7 @@ def _install_to_target_archive(
                     print(dim("\n  No agent config directories detected in this project."))
                     print(dim("  Tip: Use --tool <name> to install directly into a specific agent's directory."))
 
-        _write_install_metadata(install_dir, namespace, name, version, tree_hash)
+        _write_install_metadata(install_dir, namespace, name, version, tree_hash, auto_improve=getattr(args, "auto_improve", False))
     
         return install_dir
 
@@ -4211,7 +4215,7 @@ def _install_to_target_archive(
         print(green(f"\n  Installed @{namespace}/{name}@{version}"))
         print(f"  Location: {install_dir}")
 
-    _write_install_metadata(install_dir, namespace, name, version, tree_hash)
+    _write_install_metadata(install_dir, namespace, name, version, tree_hash, auto_improve=getattr(args, "auto_improve", False))
 
     return install_dir
 
@@ -5357,6 +5361,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="Install location: project = tool's subdir in current folder (default), global = tool's global skills dir")
     p_install.add_argument("--skills-dir", help="Override install path directly (ignores --tool and --location)")
     p_install.add_argument("--no-symlink", action="store_true", help="Install to .agents/skills/ without creating agent symlinks")
+    p_install.add_argument("--auto-improve", action="store_true", help="Enable self-improvement: inject improvable: true and registry fields into SKILL.md frontmatter")
 
     # -- search -------------------------------------------------------------
     p_search = subparsers.add_parser("search", help="Search for skills")
