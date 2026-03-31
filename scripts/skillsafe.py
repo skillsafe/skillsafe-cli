@@ -2894,7 +2894,7 @@ def cmd_update(args: argparse.Namespace) -> None:
 def cmd_upgrade(args: argparse.Namespace) -> None:
     """Check all installed skills for newer registry versions and reinstall outdated ones."""
     cfg = load_config()
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg.get("api_key", ""))
+    client = SkillSafeClient(api_base=getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg.get("api_key", ""))
 
     skill_ref: Optional[str] = getattr(args, "skill", None)
     tool_filter: Optional[str] = getattr(args, "tool", None)
@@ -3431,7 +3431,8 @@ def cmd_save(args: argparse.Namespace) -> None:
         print(f"  '{name}' is reserved and has no need to save.")
         return
 
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+    api_base = getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE)
+    client = SkillSafeClient(api_base=api_base, api_key=cfg["api_key"])
 
     # Auto-resolve version if not provided
     if not version:
@@ -3616,7 +3617,7 @@ def cmd_share(args: argparse.Namespace) -> None:
 
     print(f"Sharing {bold(f'@{namespace}/{name}')} v{version} ({visibility})...\n")
 
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+    client = SkillSafeClient(api_base=getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
 
     try:
         result = client.share(namespace, name, version, visibility=visibility, expires_in=expires)
@@ -3652,7 +3653,7 @@ def cmd_install(args: argparse.Namespace) -> None:
         share_id = skill_ref.split("/share/")[-1].split("?")[0]
 
     api_key = cfg.get("api_key")
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=api_key)
+    client = SkillSafeClient(api_base=getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE), api_key=api_key)
 
     # ---------- Download ----------
 
@@ -4230,7 +4231,7 @@ def cmd_search(args: argparse.Namespace) -> None:
     fetch_all: bool = getattr(args, "all", False)
 
     cfg = load_config()
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE))
+    client = SkillSafeClient(api_base=getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE))
 
     try:
         if fetch_all:
@@ -4300,7 +4301,7 @@ def cmd_yank(args: argparse.Namespace) -> None:
 
     print(f"Yanking {bold(f'@{namespace}/{name}')} v{version}...\n")
 
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+    client = SkillSafeClient(api_base=getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
 
     try:
         client.yank(namespace, name, version, reason=reason)
@@ -4344,7 +4345,7 @@ def cmd_import(args: argparse.Namespace) -> None:
 
     print(f"Importing {bold(raw_url)} into SkillSafe...\n")
 
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+    client = SkillSafeClient(api_base=getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
 
     try:
         body = json.dumps({"url": raw_url}).encode()
@@ -4419,7 +4420,7 @@ def cmd_demo(args: argparse.Namespace) -> None:
 
     print(f"Uploading demo for {bold(f'@{namespace}/{name}')} v{version}...\n")
 
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+    client = SkillSafeClient(api_base=getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
 
     try:
         result = client.upload_demo(namespace, name, version, demo_json, title=title)
@@ -4715,7 +4716,7 @@ def cmd_demo_from_session(args: argparse.Namespace) -> None:
     namespace, name = parse_skill_ref(skill_ref)
     print(f"\nUploading demo for {bold(f'@{namespace}/{name}')} v{version}...")
 
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+    client = SkillSafeClient(api_base=getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
     try:
         result = client.upload_demo(namespace, name, version, demo_json, title=title)
     except SkillSafeError as e:
@@ -4738,7 +4739,7 @@ def cmd_info(args: argparse.Namespace) -> None:
     """Show detailed information about a skill."""
     namespace, name = parse_skill_ref(args.skill)
     cfg = load_config()
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg.get("api_key"))
+    client = SkillSafeClient(api_base=getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg.get("api_key"))
 
     try:
         meta = client.get_metadata(namespace, name, auth=True)
@@ -4963,7 +4964,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
     print(f"Uploading eval results for {bold(f'@{namespace}/{name}')} v{version}...\n")
 
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+    client = SkillSafeClient(api_base=getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
     try:
         result = client._request(
             "POST",
@@ -5022,7 +5023,7 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
 
     print(f"Uploading benchmark for {bold(f'@{namespace}/{name}')} v{version} ({args.runs} runs)...\n")
 
-    client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+    client = SkillSafeClient(api_base=getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
     try:
         result = client._request(
             "POST",
@@ -5060,7 +5061,7 @@ def cmd_claim(args: argparse.Namespace) -> None:
     if source.startswith("github.com/") or source.startswith("https://github.com/"):
         raw_url = source if source.startswith("https://") else f"https://{source}"
         print(f"Claiming GitHub skill {bold(raw_url)} on SkillSafe...\n")
-        client = SkillSafeClient(api_base=cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
+        client = SkillSafeClient(api_base=getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE), api_key=cfg["api_key"])
         try:
             result = client._request(
                 "POST",
