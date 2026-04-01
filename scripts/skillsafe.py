@@ -2330,6 +2330,54 @@ class SkillSafeClient:
         resp = self._request("GET", "/v1/account")
         return resp.get("data", resp)
 
+    # -- Agent API ----------------------------------------------------------
+
+    def create_agent(self, name: str, platform: str, description: Optional[str] = None) -> Dict[str, Any]:
+        """POST /v1/agents — create a new agent identity."""
+        body: Dict[str, Any] = {"name": name, "platform": platform}
+        if description:
+            body["description"] = description
+        resp = self._request("POST", "/v1/agents", body=json.dumps(body).encode(), content_type="application/json")
+        return resp.get("data", resp)
+
+    def list_agents(self) -> List[Dict[str, Any]]:
+        """GET /v1/agents — list all agents for the authenticated user."""
+        resp = self._request("GET", "/v1/agents")
+        data = resp.get("data", resp)
+        return data if isinstance(data, list) else []
+
+    def save_agent_snapshot(
+        self,
+        agent_id: str,
+        files: List[Tuple[str, bytes]],
+        version_tag: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """POST /v1/agents/:agentId/snapshots — save a configuration snapshot (multipart)."""
+        metadata: Dict[str, Any] = {}
+        if version_tag:
+            metadata["version_tag"] = version_tag
+        if description:
+            metadata["description"] = description
+
+        fields: List[Tuple[str, str, bytes, str]] = [
+            ("metadata", "", json.dumps(metadata).encode("utf-8"), "application/json"),
+        ]
+        for i, (file_path, content) in enumerate(files):
+            fields.append((f"file_{i}", file_path, content, "text/plain; charset=utf-8"))
+
+        body, ct = self._build_multipart(fields)
+        aid = self._encode_path_segment(agent_id)
+        resp = self._request("POST", f"/v1/agents/{aid}/snapshots", body=body, content_type=ct)
+        return resp.get("data", resp)
+
+    def list_agent_snapshots(self, agent_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """GET /v1/agents/:agentId/snapshots — list snapshots."""
+        aid = self._encode_path_segment(agent_id)
+        resp = self._request("GET", f"/v1/agents/{aid}/snapshots?limit={limit}")
+        data = resp.get("data", resp)
+        return data if isinstance(data, list) else []
+
 
 # ---------------------------------------------------------------------------
 # V2 manifest-based install
@@ -5111,6 +5159,257 @@ def cmd_claim(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Agent subcommand
+# ---------------------------------------------------------------------------
+
+_AGENT_SNAPSHOT_SKIP_PATTERNS = {
+    ".git", "__pycache__", "node_modules", ".DS_Store", ".env",
+    ".skillsafe-agent.json",
+}
+_AGENT_SNAPSHOT_SKIP_EXTENSIONS = {".pyc", ".pyo", ".class", ".o", ".so", ".dll", ".exe", ".bin"}
+_AGENT_SNAPSHOT_MAX_FILE_SIZE = 512 * 1024  # 512 KB per file
+_AGENT_SNAPSHOT_MAX_TOTAL_SIZE = 10 * 1024 * 1024  # 10 MB total
+_AGENT_IDENTITY_FILE = ".skillsafe-agent.json"
+_VALID_AGENT_PLATFORMS = ["claude", "cursor", "windsurf", "openclaw", "cline"]
+
+
+def _collect_agent_files(root: Path) -> List[Tuple[str, bytes]]:
+    """Walk root and collect text files suitable for an agent snapshot.
+
+    Returns list of (relative_path, content_bytes).
+    """
+    collected: List[Tuple[str, bytes]] = []
+    total_size = 0
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Skip hidden/junk directories in-place
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _AGENT_SNAPSHOT_SKIP_PATTERNS and not d.startswith(".")
+        ]
+
+        for fname in sorted(filenames):
+            if fname in _AGENT_SNAPSHOT_SKIP_PATTERNS:
+                continue
+            if any(fname.endswith(ext) for ext in _AGENT_SNAPSHOT_SKIP_EXTENSIONS):
+                continue
+            if fname.startswith("."):
+                continue
+
+            full = Path(dirpath) / fname
+            try:
+                size = full.stat().st_size
+            except OSError:
+                continue
+
+            if size > _AGENT_SNAPSHOT_MAX_FILE_SIZE:
+                print(f"  {dim(f'Skipping {full.relative_to(root)} (too large: {size // 1024} KB)')}")
+                continue
+
+            try:
+                content = full.read_bytes()
+                # Reject binary files (non-UTF-8)
+                content.decode("utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+
+            rel = str(full.relative_to(root))
+            total_size += size
+            if total_size > _AGENT_SNAPSHOT_MAX_TOTAL_SIZE:
+                print(f"  {yellow('Warning: total size exceeds 10 MB — stopping file collection early.')}")
+                break
+
+            collected.append((rel, content))
+
+    return collected
+
+
+def cmd_agent(args: argparse.Namespace) -> None:
+    """Dispatch agent subcommands: save, list, snapshots."""
+    action = getattr(args, "agent_action", None)
+
+    if action == "save":
+        _cmd_agent_save(args)
+    elif action == "list":
+        _cmd_agent_list(args)
+    elif action == "snapshots":
+        _cmd_agent_snapshots(args)
+    else:
+        # Print agent help
+        print("Usage: skillsafe agent <subcommand> [options]\n")
+        print("Subcommands:")
+        print("  save [path]            Save a snapshot of agent files to the registry")
+        print("  list                   List your agent identities")
+        print("  snapshots <agent-id>   List snapshots for an agent")
+        print("\nExamples:")
+        print("  skillsafe agent save .                            # snapshot current directory")
+        print("  skillsafe agent save . --name my-agent --platform claude")
+        print("  skillsafe agent save . --agent-id agt_abc123 --tag v1.2")
+        print("  skillsafe agent list")
+        print("  skillsafe agent snapshots agt_abc123")
+        sys.exit(0)
+
+
+def _cmd_agent_save(args: argparse.Namespace) -> None:
+    """Save a snapshot of agent files to the registry."""
+    cfg = require_config()
+    path = Path(getattr(args, "path", ".")).resolve()
+
+    if not path.is_dir():
+        print(f"Error: {path} is not a directory.", file=sys.stderr)
+        sys.exit(1)
+
+    api_base = getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE)
+    client = SkillSafeClient(api_base=api_base, api_key=cfg["api_key"])
+
+    # Resolve agent ID: CLI flag > identity file > create new
+    agent_id: Optional[str] = getattr(args, "agent_id", None)
+    identity_file = path / _AGENT_IDENTITY_FILE
+
+    if not agent_id and identity_file.exists():
+        try:
+            identity = json.loads(identity_file.read_text())
+            agent_id = identity.get("agent_id")
+            if agent_id:
+                print(f"  Using agent {bold(agent_id)} (from {_AGENT_IDENTITY_FILE})")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if not agent_id:
+        # Need to create a new agent
+        name = getattr(args, "name", None)
+        platform = getattr(args, "platform", None)
+
+        if not name or not platform:
+            print(f"Error: No agent identity found. Provide --name and --platform to create one.", file=sys.stderr)
+            print(f"  Valid platforms: {', '.join(_VALID_AGENT_PLATFORMS)}", file=sys.stderr)
+            print(f"  Example: skillsafe agent save . --name my-agent --platform claude", file=sys.stderr)
+            sys.exit(1)
+
+        if platform not in _VALID_AGENT_PLATFORMS:
+            print(f"Error: Invalid platform '{platform}'. Valid: {', '.join(_VALID_AGENT_PLATFORMS)}", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"Creating agent {bold(name)} ({platform})...")
+        try:
+            description = getattr(args, "description", None)
+            agent = client.create_agent(name, platform, description)
+            agent_id = agent.get("id") or agent.get("agent_id")
+            if not agent_id:
+                print("Error: Server did not return an agent ID.", file=sys.stderr)
+                sys.exit(1)
+            print(f"  {green('✓')} Created agent {bold(agent_id)}")
+
+            # Persist agent ID to identity file
+            try:
+                identity_data = {"agent_id": agent_id, "name": name, "platform": platform}
+                identity_file.write_text(json.dumps(identity_data, indent=2) + "\n")
+                print(f"  Saved identity to {_AGENT_IDENTITY_FILE}")
+            except OSError as e:
+                print(f"  {yellow(f'Warning: could not write {_AGENT_IDENTITY_FILE}: {e}')}")
+
+        except SkillSafeError as e:
+            print(f"  Error: {e.message}", file=sys.stderr)
+            sys.exit(1)
+
+    # Collect files
+    print(f"\nCollecting files from {dim(str(path))}...")
+    files = _collect_agent_files(path)
+
+    if not files:
+        print("Error: No text files found to snapshot.", file=sys.stderr)
+        sys.exit(1)
+
+    total_kb = sum(len(c) for _, c in files) / 1024
+    print(f"  Files: {len(files)}, total size: {total_kb:.1f} KB")
+
+    # Upload snapshot
+    version_tag = getattr(args, "tag", None)
+    description = getattr(args, "description", None)
+    tag_label = f" [{version_tag}]" if version_tag else ""
+    print(f"\nSaving snapshot{tag_label} to agent {bold(agent_id)}...")
+
+    try:
+        snapshot = client.save_agent_snapshot(agent_id, files, version_tag=version_tag, description=description)
+    except SkillSafeError as e:
+        print(f"  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+
+    snap_id = snapshot.get("id") or snapshot.get("snapshot_id", "")
+    snap_at = snapshot.get("snapshot_at", "")
+    file_count = snapshot.get("file_count", len(files))
+    total_size = snapshot.get("total_size", 0)
+
+    print(f"\n  {green('✓')} Snapshot saved")
+    if snap_id:
+        print(f"  ID:        {bold(snap_id)}")
+    if version_tag:
+        print(f"  Tag:       {version_tag}")
+    if snap_at:
+        print(f"  Saved at:  {snap_at}")
+    print(f"  Files:     {file_count}  ({total_size / 1024:.1f} KB)")
+
+
+def _cmd_agent_list(args: argparse.Namespace) -> None:
+    """List all agent identities."""
+    cfg = require_config()
+    api_base = getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE)
+    client = SkillSafeClient(api_base=api_base, api_key=cfg["api_key"])
+
+    print("Fetching agents...")
+    try:
+        agents = client.list_agents()
+    except SkillSafeError as e:
+        print(f"  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+
+    if not agents:
+        print("  No agents found.")
+        print(f"\n  Create one: skillsafe agent save . --name my-agent --platform claude")
+        return
+
+    print(f"\n  {'ID':<20}  {'Name':<24}  {'Platform':<12}  Created")
+    print(f"  {'─' * 20}  {'─' * 24}  {'─' * 12}  {'─' * 20}")
+    for a in agents:
+        aid = (a.get("id") or a.get("agent_id") or "")[:20]
+        name = (a.get("name") or "")[:24]
+        platform = (a.get("platform") or "")[:12]
+        created = (a.get("created_at") or "")[:20]
+        print(f"  {aid:<20}  {name:<24}  {platform:<12}  {created}")
+
+
+def _cmd_agent_snapshots(args: argparse.Namespace) -> None:
+    """List snapshots for an agent."""
+    cfg = require_config()
+    agent_id: str = args.agent_id
+    api_base = getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE)
+    client = SkillSafeClient(api_base=api_base, api_key=cfg["api_key"])
+
+    limit = getattr(args, "limit", 20)
+    print(f"Fetching snapshots for {bold(agent_id)}...")
+    try:
+        snapshots = client.list_agent_snapshots(agent_id, limit=limit)
+    except SkillSafeError as e:
+        print(f"  Error: {e.message}", file=sys.stderr)
+        sys.exit(1)
+
+    if not snapshots:
+        print("  No snapshots found.")
+        print(f"\n  Save one: skillsafe agent save . --agent-id {agent_id}")
+        return
+
+    print(f"\n  {'Snapshot ID':<26}  {'Tag':<16}  {'Files':>5}  {'Size':>8}  Saved at")
+    print(f"  {'─' * 26}  {'─' * 16}  {'─' * 5}  {'─' * 8}  {'─' * 20}")
+    for s in snapshots:
+        sid = (s.get("id") or s.get("snapshot_id") or "")[:26]
+        tag = (s.get("version_tag") or "")[:16]
+        fcount = s.get("file_count", 0)
+        size_kb = s.get("total_size", 0) / 1024
+        saved = (s.get("snapshot_at") or "")[:20]
+        print(f"  {sid:<26}  {tag:<16}  {fcount:>5}  {size_kb:>7.1f}K  {saved}")
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -5315,6 +5614,10 @@ def main(argv: Optional[List[str]] = None) -> None:
               skillsafe demo-from-session ~/.claude/projects/.../session.jsonl @alice/my-skill --version 1.0.0 --title "Installing a skill"
               skillsafe demo-from-session session.jsonl --title "Preview" --no-upload
               skillsafe demo-from-session session.jsonl @alice/my-skill --version 1.0.0 --title "Skill demo" --filter-keyword skillsafe
+              skillsafe agent save .                               # snapshot current dir (reads .skillsafe-agent.json)
+              skillsafe agent save . --name my-agent --platform claude  # create agent + snapshot
+              skillsafe agent list                                 # list all agent identities
+              skillsafe agent snapshots agt_abc123                 # list snapshots for an agent
         """),
     )
     parser.add_argument("--api-base", default=None, help="API base URL (default: %(default)s)")
@@ -5459,6 +5762,24 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_claim = subparsers.add_parser("claim", help="Claim a skill from another registry (ClawHub, GitHub)")
     p_claim.add_argument("source", help="Source ref: github.com/owner/repo or clawhub:owner/skill")
 
+    # -- agent --------------------------------------------------------------
+    p_agent = subparsers.add_parser("agent", help="Manage AI agent identities and configuration snapshots")
+    agent_subs = p_agent.add_subparsers(dest="agent_action")
+
+    p_agent_save = agent_subs.add_parser("save", help="Save a snapshot of agent files to the registry")
+    p_agent_save.add_argument("path", nargs="?", default=".", help="Directory to snapshot (default: current directory)")
+    p_agent_save.add_argument("--agent-id", dest="agent_id", help="Agent ID (reads from .skillsafe-agent.json if omitted)")
+    p_agent_save.add_argument("--name", help="Agent name — required when creating a new agent")
+    p_agent_save.add_argument("--platform", choices=_VALID_AGENT_PLATFORMS, help="Agent platform — required when creating a new agent")
+    p_agent_save.add_argument("--tag", metavar="VERSION_TAG", help="Optional version tag for this snapshot (e.g. v1.2)")
+    p_agent_save.add_argument("--description", help="Optional description for this snapshot")
+
+    p_agent_list = agent_subs.add_parser("list", help="List your agent identities")
+
+    p_agent_snaps = agent_subs.add_parser("snapshots", help="List snapshots for an agent")
+    p_agent_snaps.add_argument("agent_id", help="Agent ID (e.g. agt_abc123)")
+    p_agent_snaps.add_argument("--limit", type=int, default=20, help="Max snapshots to show (default: 20)")
+
     args = parser.parse_args(argv)
 
     # Ensure api_base is set in the namespace (subcommand may not define it)
@@ -5513,6 +5834,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         cmd_benchmark(args)
     elif args.command == "claim":
         cmd_claim(args)
+    elif args.command == "agent":
+        cmd_agent(args)
     else:
         parser.print_help()
         sys.exit(1)
