@@ -5162,66 +5162,168 @@ def cmd_claim(args: argparse.Namespace) -> None:
 # Agent subcommand
 # ---------------------------------------------------------------------------
 
-_AGENT_SNAPSHOT_SKIP_PATTERNS = {
-    ".git", "__pycache__", "node_modules", ".DS_Store", ".env",
-    ".skillsafe-agent.json",
-}
 _AGENT_SNAPSHOT_SKIP_EXTENSIONS = {".pyc", ".pyo", ".class", ".o", ".so", ".dll", ".exe", ".bin"}
 _AGENT_SNAPSHOT_MAX_FILE_SIZE = 512 * 1024  # 512 KB per file
-_AGENT_SNAPSHOT_MAX_TOTAL_SIZE = 10 * 1024 * 1024  # 10 MB total
+_AGENT_SNAPSHOT_MAX_TOTAL_SIZE = 5 * 1024 * 1024  # 5 MB total for config snapshots
 _AGENT_IDENTITY_FILE = ".skillsafe-agent.json"
 _VALID_AGENT_PLATFORMS = ["claude", "cursor", "windsurf", "openclaw", "cline"]
 
+# Config files captured at the root of a tool config directory (e.g. ~/.claude)
+_AGENT_CONFIG_ROOT_FILES = {
+    "CLAUDE.md", "GEMINI.md", "AGENTS.md",                  # project instructions
+    "settings.json", "settings.local.json",                  # Claude Code settings
+    "keybindings.json",                                      # keybindings
+}
+# Subdirectories to recurse into for config+memory snapshot (everything else skipped)
+_AGENT_CONFIG_SUBDIRS = {"memory"}
 
-def _collect_agent_files(root: Path) -> List[Tuple[str, bytes]]:
-    """Walk root and collect text files suitable for an agent snapshot.
+# Skills subdirectory names used by each platform
+_PLATFORM_SKILLS_SUBDIRS: Dict[str, str] = {
+    "claude":    "skills",
+    "cursor":    "skills",
+    "windsurf":  "skills",
+    "openclaw":  "skills",
+    "cline":     "skills",
+}
 
-    Returns list of (relative_path, content_bytes).
+
+def _collect_config_files(root: Path) -> List[Tuple[str, bytes]]:
+    """Collect config and memory files from a tool config directory.
+
+    Captures:
+    - Root-level config files (CLAUDE.md, settings.json, keybindings.json, etc.)
+    - memory/ subdirectory (recursive)
+
+    Intentionally excludes skills/, projects/, plugins/, history.jsonl, and
+    any other runtime data — those are large and not meaningful as config.
     """
     collected: List[Tuple[str, bytes]] = []
     total_size = 0
 
-    for dirpath, dirnames, filenames in os.walk(root):
-        # Skip hidden/junk directories in-place
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in _AGENT_SNAPSHOT_SKIP_PATTERNS and not d.startswith(".")
-        ]
+    def _add_file(full: Path, rel: str) -> bool:
+        nonlocal total_size
+        try:
+            size = full.stat().st_size
+        except OSError:
+            return True  # continue
+        if size > _AGENT_SNAPSHOT_MAX_FILE_SIZE:
+            print(f"  {dim(f'Skipping {rel} (too large: {size // 1024} KB)')}")
+            return True
+        try:
+            content = full.read_bytes()
+            content.decode("utf-8")  # reject binaries
+        except (OSError, UnicodeDecodeError):
+            return True
+        total_size += size
+        if total_size > _AGENT_SNAPSHOT_MAX_TOTAL_SIZE:
+            print(f"  {yellow('Warning: config snapshot exceeds 5 MB limit — stopping.')}")
+            return False  # stop
+        collected.append((rel, content))
+        return True
 
-        for fname in sorted(filenames):
-            if fname in _AGENT_SNAPSHOT_SKIP_PATTERNS:
-                continue
-            if any(fname.endswith(ext) for ext in _AGENT_SNAPSHOT_SKIP_EXTENSIONS):
-                continue
-            if fname.startswith("."):
-                continue
+    # Root-level config files
+    for fname in sorted(os.listdir(root)):
+        if fname not in _AGENT_CONFIG_ROOT_FILES:
+            continue
+        full = root / fname
+        if full.is_file():
+            if not _add_file(full, fname):
+                return collected
 
-            full = Path(dirpath) / fname
-            try:
-                size = full.stat().st_size
-            except OSError:
-                continue
-
-            if size > _AGENT_SNAPSHOT_MAX_FILE_SIZE:
-                print(f"  {dim(f'Skipping {full.relative_to(root)} (too large: {size // 1024} KB)')}")
-                continue
-
-            try:
-                content = full.read_bytes()
-                # Reject binary files (non-UTF-8)
-                content.decode("utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-
-            rel = str(full.relative_to(root))
-            total_size += size
-            if total_size > _AGENT_SNAPSHOT_MAX_TOTAL_SIZE:
-                print(f"  {yellow('Warning: total size exceeds 10 MB — stopping file collection early.')}")
-                break
-
-            collected.append((rel, content))
+    # Allowed subdirectories (memory/, etc.)
+    for subdir_name in sorted(_AGENT_CONFIG_SUBDIRS):
+        subdir = root / subdir_name
+        if not subdir.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(subdir):
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            for fname in sorted(filenames):
+                if fname.startswith(".") or any(fname.endswith(e) for e in _AGENT_SNAPSHOT_SKIP_EXTENSIONS):
+                    continue
+                full = Path(dirpath) / fname
+                rel = str(full.relative_to(root))
+                if not _add_file(full, rel):
+                    return collected
 
     return collected
+
+
+def _build_skills_manifest(root: Path, platform: str) -> Optional[bytes]:
+    """Scan the skills directory and build a skills-manifest.json.
+
+    Each entry captures the registry coordinates from .skillsafe.json (if present)
+    or from the SKILL.md frontmatter registry field.  Skills without registry info
+    are listed as 'local' source so the user knows they need to publish them.
+
+    Returns JSON bytes, or None if no skills directory found.
+    """
+    skills_subdir = _PLATFORM_SKILLS_SUBDIRS.get(platform, "skills")
+    skills_dir = root / skills_subdir
+    if not skills_dir.is_dir():
+        return None
+
+    entries: List[Dict[str, Any]] = []
+
+    for item in sorted(skills_dir.iterdir()):
+        if not item.is_dir():
+            continue
+        skill_name = item.name
+
+        # Read .skillsafe.json for registry metadata
+        meta_file = item / ".skillsafe.json"
+        registry_ref: Optional[str] = None
+        version: Optional[str] = None
+        tree_hash: Optional[str] = None
+        share_link: Optional[str] = None
+
+        if meta_file.exists():
+            try:
+                meta = json.loads(meta_file.read_text())
+                namespace = (meta.get("namespace") or "").lstrip("@")
+                name = meta.get("name") or skill_name
+                version = meta.get("version")
+                tree_hash = meta.get("tree_hash")
+                share_link = meta.get("share_link") or meta.get("shareLink")
+                if namespace and name:
+                    registry_ref = f"@{namespace}/{name}"
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # Fallback: read registry field from SKILL.md frontmatter
+        if not registry_ref:
+            skill_md = item / "SKILL.md"
+            if skill_md.exists():
+                try:
+                    text = skill_md.read_text(errors="replace")
+                    m = re.search(r'^registry:\s*["\']?(@[\w/-]+)["\']?\s*$', text, re.MULTILINE)
+                    if m:
+                        registry_ref = m.group(1)
+                    if not version:
+                        mv = re.search(r'^version:\s*["\']?([0-9]+\.[0-9]+\.[0-9][^\s"\']*)["\']?\s*$', text, re.MULTILINE)
+                        if mv:
+                            version = mv.group(1)
+                except OSError:
+                    pass
+
+        entry: Dict[str, Any] = {"name": skill_name, "source": "registry" if registry_ref else "local"}
+        if registry_ref:
+            entry["registry"] = registry_ref
+        if version:
+            entry["version"] = version
+        if tree_hash:
+            entry["tree_hash"] = tree_hash
+        if share_link:
+            entry["share_link"] = share_link
+        entries.append(entry)
+
+    if not entries:
+        return None
+
+    manifest = {
+        "generated_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+        "skills": entries,
+    }
+    return json.dumps(manifest, indent=2).encode("utf-8")
 
 
 def cmd_agent(args: argparse.Namespace) -> None:
@@ -5238,13 +5340,13 @@ def cmd_agent(args: argparse.Namespace) -> None:
         # Print agent help
         print("Usage: skillsafe agent <subcommand> [options]\n")
         print("Subcommands:")
-        print("  save [path]            Save a snapshot of agent files to the registry")
+        print("  save [path]            Save config + memory snapshot (skills referenced by registry link)")
         print("  list                   List your agent identities")
         print("  snapshots <agent-id>   List snapshots for an agent")
         print("\nExamples:")
-        print("  skillsafe agent save .                            # snapshot current directory")
-        print("  skillsafe agent save . --name my-agent --platform claude")
-        print("  skillsafe agent save . --agent-id agt_abc123 --tag v1.2")
+        print("  skillsafe agent save ~/.claude --name my-agent --platform claude")
+        print("  skillsafe agent save ~/.claude --agent-id agt_abc123 --tag v1.2")
+        print("  skillsafe agent save ~/.claude                    # re-snapshot (reads .skillsafe-agent.json)")
         print("  skillsafe agent list")
         print("  skillsafe agent snapshots agt_abc123")
         sys.exit(0)
@@ -5312,12 +5414,28 @@ def _cmd_agent_save(args: argparse.Namespace) -> None:
             print(f"  Error: {e.message}", file=sys.stderr)
             sys.exit(1)
 
-    # Collect files
-    print(f"\nCollecting files from {dim(str(path))}...")
-    files = _collect_agent_files(path)
+    # Collect config + memory files
+    platform = getattr(args, "platform", None) or "claude"
+    # If agent was loaded from identity file, recover platform from it
+    if identity_file.exists() and not getattr(args, "platform", None):
+        try:
+            identity = json.loads(identity_file.read_text())
+            platform = identity.get("platform", "claude")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    print(f"\nCollecting config and memory files from {dim(str(path))}...")
+    files = _collect_config_files(path)
+
+    # Build skills manifest and append as a virtual file
+    skills_manifest_bytes = _build_skills_manifest(path, platform)
+    if skills_manifest_bytes:
+        files.append(("skills-manifest.json", skills_manifest_bytes))
+        skill_count = len(json.loads(skills_manifest_bytes).get("skills", []))
+        print(f"  Skills manifest: {skill_count} skill(s) referenced by registry link")
 
     if not files:
-        print("Error: No text files found to snapshot.", file=sys.stderr)
+        print("Error: No config files found. Is this a tool config directory (e.g. ~/.claude)?", file=sys.stderr)
         sys.exit(1)
 
     total_kb = sum(len(c) for _, c in files) / 1024
@@ -5347,7 +5465,7 @@ def _cmd_agent_save(args: argparse.Namespace) -> None:
         print(f"  Tag:       {version_tag}")
     if snap_at:
         print(f"  Saved at:  {snap_at}")
-    print(f"  Files:     {file_count}  ({total_size / 1024:.1f} KB)")
+    print(f"  Files:     {file_count}  ({int(total_size) / 1024:.1f} KB)")
 
 
 def _cmd_agent_list(args: argparse.Namespace) -> None:
@@ -5614,8 +5732,8 @@ def main(argv: Optional[List[str]] = None) -> None:
               skillsafe demo-from-session ~/.claude/projects/.../session.jsonl @alice/my-skill --version 1.0.0 --title "Installing a skill"
               skillsafe demo-from-session session.jsonl --title "Preview" --no-upload
               skillsafe demo-from-session session.jsonl @alice/my-skill --version 1.0.0 --title "Skill demo" --filter-keyword skillsafe
-              skillsafe agent save .                               # snapshot current dir (reads .skillsafe-agent.json)
-              skillsafe agent save . --name my-agent --platform claude  # create agent + snapshot
+              skillsafe agent save ~/.claude --name my-agent --platform claude  # create agent + snapshot config
+              skillsafe agent save ~/.claude                       # re-snapshot (reads .skillsafe-agent.json)
               skillsafe agent list                                 # list all agent identities
               skillsafe agent snapshots agt_abc123                 # list snapshots for an agent
         """),
