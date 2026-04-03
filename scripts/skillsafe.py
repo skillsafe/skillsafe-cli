@@ -3358,6 +3358,7 @@ def cmd_save(args: argparse.Namespace) -> None:
 
     # Read defaults from skillsafe.yaml if present (preferred), then .skillsafe.json
     yaml_meta_path = path / "skillsafe.yaml"
+    local_meta_path = path / ".skillsafe.json"
     if yaml_meta_path.exists():
         try:
             raw = yaml_meta_path.read_text()
@@ -3374,7 +3375,6 @@ def cmd_save(args: argparse.Namespace) -> None:
             pass
     else:
         # Legacy .skillsafe.json fallback
-        local_meta_path = path / ".skillsafe.json"
         if local_meta_path.exists():
             try:
                 with open(local_meta_path) as f:
@@ -4246,9 +4246,9 @@ def cmd_search(args: argparse.Namespace) -> None:
         ns = s.get("namespace", "")
         nm = s.get("name_display", s.get("name", ""))
         ref = f"{ns}/{nm}"
-        ver = s.get("latest_version", "-")
-        stars = s.get("star_count", 0)
-        installs = s.get("install_count", 0)
+        ver = s.get("latest_version") or "-"
+        stars = s.get("star_count") or 0
+        installs = s.get("install_count") or 0
         desc = (s.get("description") or "")[:40]
         print(f"  {ref:<35} {ver:<10} {stars:<7} {installs:<10} {desc}")
 
@@ -5434,8 +5434,8 @@ def _cmd_agent_snapshots(args: argparse.Namespace) -> None:
     for s in snapshots:
         sid = (s.get("id") or s.get("snapshot_id") or "")[:26]
         tag = (s.get("version_tag") or "")[:16]
-        fcount = s.get("file_count", 0)
-        size_kb = s.get("total_size", 0) / 1024
+        fcount = int(s.get("file_count") or 0)
+        size_kb = int(s.get("total_size") or 0) / 1024
         saved = (s.get("snapshot_at") or "")[:20]
         print(f"  {sid:<26}  {tag:<16}  {fcount:>5}  {size_kb:>7.1f}K  {saved}")
 
