@@ -7,7 +7,6 @@ and verify skills from the SkillSafe registry. Designed to run inside
 Claude Code, Cursor, Windsurf, Codex, Gemini CLI, OpenCode, OpenClaw, and similar AI-assisted development tools.
 
 Usage:
-    python skillsafe.py init [path]                       # create skillsafe.yaml wizard
     python skillsafe.py auth                              # browser login
     python skillsafe.py scan <path>
     python skillsafe.py bom <path> [-o bom.json]
@@ -2791,16 +2790,17 @@ def cmd_whoami(args: argparse.Namespace) -> None:
         print(f"\n  Run {bold('skillsafe auth')} to get started.")
         sys.exit(1)
 
+    api_base = getattr(args, "api_base", None) or cfg.get("api_base", DEFAULT_API_BASE)
+
     # Show local config info
     print(f"\n  {bold('Local config')}")
     print(f"  Username:    {cfg.get('username', dim('unknown'))}")
     print(f"  Namespace:   {cfg.get('namespace', dim('unknown'))}")
     print(f"  API key:     {dim(_mask_api_key(api_key))}")
-    print(f"  API base:    {cfg.get('api_base', DEFAULT_API_BASE)}")
+    print(f"  API base:    {api_base}")
     print(f"  Config file: {CONFIG_FILE}")
 
     # Verify against server
-    api_base = cfg.get("api_base", DEFAULT_API_BASE)
     client = SkillSafeClient(api_base=api_base, api_key=api_key)
 
     try:
@@ -3354,7 +3354,10 @@ def cmd_save(args: argparse.Namespace) -> None:
             sys.exit(1)
 
     name = path.name
-    namespace = cfg["username"]
+    namespace = cfg.get("username")
+    if not namespace:
+        print("Error: username not found in config. Run 'skillsafe auth' or 'skillsafe whoami' first.", file=sys.stderr)
+        sys.exit(1)
 
     # Read defaults from skillsafe.yaml if present (preferred), then .skillsafe.json
     yaml_meta_path = path / "skillsafe.yaml"

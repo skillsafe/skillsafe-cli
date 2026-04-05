@@ -42,17 +42,11 @@ python3 <skill-dir>/scripts/skillsafe.py update @ns/name
 python3 <skill-dir>/scripts/skillsafe.py update --all
 ```
 
-**Installing into the current project:** By default (no flags), `install` places the skill in `.claude/skills/` inside the current working directory so it is immediately available to the agent for this project. Use `--tool project` to make this explicit. Use `--tool <name>` (`claude`, `cursor`, `windsurf`, `codex`, `gemini`, `opencode`, `openclaw`, `cline`, `roo`, `goose`, `copilot`, `kiro`, `trae`, `amp`, `aider`, `vscode`, `antigravity`, `clawdbot`, `droid`, `kilo`) to install globally instead. For any other tool, use `--skills-dir <path>` with that tool's skills directory path.
+**Installing into the current project:** By default (no flags), `install` places the skill in `.agents/skills/` inside the current working directory and auto-symlinks into detected agent directories (`.claude/skills/`, `.cursor/skills/`, etc.) so it is immediately available. Use `--location project` to make this explicit. Use `--tool <name>` (`claude`, `cursor`, `windsurf`, `codex`, `gemini`, `opencode`, `openclaw`, `cline`, `roo`, `goose`, `copilot`, `kiro`, `trae`, `amp`, `aider`, `vscode`, `antigravity`, `clawdbot`, `droid`, `kilo`) with `--location global` to install globally instead. For any other tool, use `--skills-dir <path>` with that tool's skills directory path.
 
 ## Available Commands
 
 Run all commands using `python3` and the script at `scripts/skillsafe.py` inside this skill's directory.
-
-### Init — Create a skillsafe.yaml manifest
-```bash
-python3 <skill-dir>/scripts/skillsafe.py init [path]
-```
-Interactive wizard that generates a `skillsafe.yaml` manifest (and `.skillsafe.json` for legacy compatibility) in the given directory (defaults to current directory). Prompts for skill name, namespace, version, description, category, tags, and entrypoint file. After running, prints the next steps: auth → save → share.
 
 ### Auth — Sign in via browser
 ```bash
@@ -97,7 +91,7 @@ Sharing requires a scan report because SkillSafe's dual-side verification model 
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<skill-name> [--version <ver>] [--skills-dir <dir>] [--tool <name>]
 ```
-Downloads the archive, verifies the tree hash matches, scans the downloaded files, submits a verification report, and installs. By default (no flags), installs into the **current project's `.claude/skills/`** directory so the agent can use it immediately without restarting. Use `--tool project` to make this explicit. Use `--tool <name>` to install into a known tool's **global** skills directory (`--tool claude` → `~/.claude/skills/`, `--tool cursor`, `--tool windsurf`, `--tool openclaw`). Use `--skills-dir <path>` for any other tool — pass the parent directory and the skill will be placed in a subdirectory named after the skill.
+Downloads the archive, verifies the tree hash matches, scans the downloaded files, submits a verification report, and installs. By default (no flags), installs into the **current project's `.agents/skills/`** directory and auto-symlinks into detected agent directories (`.claude/skills/`, `.cursor/skills/`, etc.). Use `--location project` to make this explicit. Use `--tool <name> --location global` to install into a known tool's **global** skills directory (`--tool claude` → `~/.claude/skills/`, `--tool cursor`, `--tool windsurf`, `--tool openclaw`). Use `--skills-dir <path>` for any other tool — pass the parent directory and the skill will be placed in a subdirectory named after the skill.
 
 The install command does more than download — it independently re-scans the files and submits that report to the server, which compares it against the sharer's original scan. This is the consumer side of dual-side verification: if someone tampered with the archive between publishing and download, the tree hash will mismatch and the install will be blocked. Running the scan locally (rather than trusting the server's copy) is what makes this meaningful — it's the consumer's independent check, not just a server-side assertion.
 
@@ -247,7 +241,7 @@ Use this workflow when the user wants to edit an existing skill, publish a new v
 python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name>
 ```
 
-This installs into `.claude/skills/` in the current project by default. After install, a `.skillsafe.json` metadata file is written into the skill directory with the namespace, name, version, and tree hash.
+This installs into `.agents/skills/` in the current project by default (with symlinks to detected agent directories). After install, a `.skillsafe.json` metadata file is written into the skill directory with the namespace, name, version, and tree hash.
 
 ### Step 2 — Edit the skill
 
