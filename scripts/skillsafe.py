@@ -5751,7 +5751,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     # -- upgrade ------------------------------------------------------------
     # -- update (self-update CLI or upgrade skills) --------------------------
     p_update = subparsers.add_parser(
-        "update",
+        "update", aliases=["upgrade", "self-update"],
         help="Update skillsafe CLI or upgrade installed skills. "
              "'update' or 'update skillsafe' updates the CLI from skillsafe.ai; "
              "'update @ns/skill' upgrades a specific skill; "
