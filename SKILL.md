@@ -1,6 +1,6 @@
 ---
 name: skillsafe
-version: 0.1.4
+version: 0.1.5
 description: Scan, save, share, install, and verify skills from the SkillSafe secured skill registry. Use this skill whenever the user mentions scanning a skill for security issues, saving or publishing a skill to a registry, sharing a skill via a link, installing someone else's skill, searching for skills, uploading a demo recording, checking skill verification status, or anything involving skill versioning, the SkillSafe CLI, or managing AI coding tool skills — even if they don't say "SkillSafe" explicitly. Also use it when the user asks to record a conversation as a demo or wants to showcase how a skill works.
 allowed-tools: Bash, Read, Write
 ---
