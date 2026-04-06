@@ -2816,6 +2816,17 @@ def cmd_whoami(args: argparse.Namespace) -> None:
         print(f"  Local config appears valid. Use {bold('--api-base')} to change the server.")
         sys.exit(1)
 
+    # Backfill missing config fields from account data
+    updated = False
+    if not cfg.get("namespace") and account.get("username"):
+        cfg["namespace"] = f"@{account['username']}"
+        updated = True
+    if not cfg.get("username") and account.get("username"):
+        cfg["username"] = account["username"]
+        updated = True
+    if updated:
+        save_config(cfg)
+
     # Show verified account details
     print(f"\n  {bold('Account')} {green('(verified)')}")
     print(f"  Email:       {account.get('email') or dim('not set')}")
@@ -3378,6 +3389,8 @@ def cmd_save(args: argparse.Namespace) -> None:
             pass
     else:
         # Legacy .skillsafe.json fallback
+        if not local_meta_path.exists():
+            print(f"  {yellow('Warning:')} No skillsafe.yaml found in {path}. Run {bold('skillsafe lint')} to validate your skill.")
         if local_meta_path.exists():
             try:
                 with open(local_meta_path) as f:
@@ -3482,8 +3495,9 @@ def cmd_save(args: argparse.Namespace) -> None:
             # Handle version collision: re-resolve version and retry once
             if (e.status == 409 or e.status == 422) and not version_re_resolved:
                 version_re_resolved = True
-                print(f"  Version {version} conflict, re-resolving...")
+                old_version = version
                 version = client.resolve_next_version(namespace, name)
+                print(f"  {yellow('Version conflict:')} {old_version} already exists, using {bold(version)} instead.")
                 metadata["version"] = version
                 # Re-negotiate with new version
                 try:
@@ -4907,7 +4921,11 @@ def cmd_eval(args: argparse.Namespace) -> None:
         model = summary.get("model") or eval_data.get("model")
         payload["eval_json"] = json.dumps(eval_data)
         if pass_rate is not None:
-            payload["pass_rate"] = float(pass_rate)
+            pr = float(pass_rate)
+            # Auto-convert 0-1 range to 0-100 (API expects 0-100)
+            if 0 < pr <= 1:
+                pr = pr * 100
+            payload["pass_rate"] = pr
         if test_cases is not None:
             payload["test_cases"] = int(test_cases)
         if pass_count is not None:
@@ -5060,11 +5078,11 @@ def cmd_claim(args: argparse.Namespace) -> None:
             print(f"    skillsafe eval @{ns}/{nm} --version 1.0.0 --eval-json eval.json")
 
     # ClawHub migration instructions
-    elif source.startswith("clawhub:") or source.startswith("clawhub.dev/"):
-        ref = source.replace("clawhub:", "").replace("clawhub.dev/", "")
+    elif source.startswith("clawhub:") or source.startswith("clawhub.ai/") or source.startswith("clawhub.dev/"):
+        ref = source.replace("clawhub:", "").replace("clawhub.ai/", "").replace("clawhub.dev/", "")
         print(f"Claiming ClawHub skill {bold(ref)} on SkillSafe...\n")
         print(f"  {yellow('ClawHub migration steps:')}")
-        print(f"  1. Clone or download the skill from ClawHub: {bold(f'clawhub.dev/{ref}')}")
+        print(f"  1. Clone or download the skill from ClawHub: {bold(f'clawhub.ai/{ref}')}")
         print(f"  2. Run `skillsafe scan <local-path>` to verify it is safe")
         print(f"  3. Run `skillsafe save <local-path>` to save it to your account")
         print(f"  4. Run `skillsafe share @<ns>/<name>` to publish")
@@ -5073,7 +5091,7 @@ def cmd_claim(args: argparse.Namespace) -> None:
 
     else:
         print(f"Error: Unsupported source '{source}'.", file=sys.stderr)
-        print("  Supported: github.com/owner/repo, clawhub:owner/skill", file=sys.stderr)
+        print("  Supported: github.com/owner/repo, clawhub.ai/owner/skill, clawhub:owner/skill", file=sys.stderr)
         sys.exit(1)
 
 
@@ -5705,7 +5723,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_search = subparsers.add_parser("search", help="Search for skills")
     p_search.add_argument("query", nargs="?", help="Search query")
     p_search.add_argument("--category", help="Filter by category")
-    p_search.add_argument("--sort", default="popular", choices=["popular", "recent", "verified", "trending", "hot"], help="Sort order")
+    p_search.add_argument("--sort", default="popular", choices=["popular", "recent", "verified", "trending", "hot", "relevance", "installs", "newest", "updated", "stars", "eval_score"], help="Sort order")
     p_search.add_argument("--limit", type=int, default=20, help="Max results per page (default: 20, max: 100)")
     p_search.add_argument("--page", type=int, default=None, help="Page number for pagination (default: 1)")
     p_search.add_argument("--all", action="store_true", help="Fetch all results across all pages")
@@ -5725,8 +5743,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_yank.add_argument("--reason", help="Reason for yanking (shown in version listings)")
 
     # -- demo ---------------------------------------------------------------
-    p_demo = subparsers.add_parser("demo", help="Upload a demo JSON recording for a skill version")
-    p_demo.add_argument("json_file", help="Path to demo JSON file (skillsafe-demo/1 schema)")
+    p_demo = subparsers.add_parser("demo", help="Upload a demo JSON recording for a skill version",
+        epilog='Demo JSON must have {"schema": "skillsafe-demo/1", "messages": [...]}. Each message: {"role": "user"|"assistant", "content": "..."}')
+    p_demo.add_argument("json_file", help="Path to demo JSON file (requires schema: skillsafe-demo/1 and messages array)")
     p_demo.add_argument("skill", help="Skill reference (e.g. @alice/my-skill)")
     p_demo.add_argument("--version", required=True, help="Skill version (e.g. 1.0.0)")
     p_demo.add_argument("--title", help="Override title from JSON (max 200 chars)")
@@ -5765,7 +5784,6 @@ def main(argv: Optional[List[str]] = None) -> None:
     p_update.add_argument("--all", action="store_true", help="Upgrade all installed skills")
     p_update.add_argument("--tool", choices=list(TOOL_SKILLS_DIRS.keys()), help="Limit --all to skills for a specific tool")
     p_update.add_argument("--dry-run", action="store_true", help="Show what would be upgraded without applying changes")
-    p_update2 = subparsers.add_parser("self-update", help="Alias for: update skillsafe")
 
     p_import = subparsers.add_parser("import", help="Import a skill from a GitHub or ClawHub URL")
     p_import.add_argument("url", help="Skill URL (e.g. github.com/owner/repo or https://clawhub.ai/owner/skill)")
