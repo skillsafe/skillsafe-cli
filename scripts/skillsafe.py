@@ -3827,8 +3827,11 @@ def _submit_verification(
         verdict_result = client.verify(namespace, name, version, consumer_report)
         return verdict_result.get("verdict", "unknown"), verdict_result.get("details", {})
     except SkillSafeError as e:
-        if e.status in (401, 403):
+        if e.status == 401:
             print("  Verification skipped (sign in with 'skillsafe auth' to enable dual-side verification).")
+            return "skipped", {}
+        elif e.status == 403:
+            print(f"  Verification skipped ({e.message}).")
             return "skipped", {}
         elif e.status == 404 or "no publisher" in e.message.lower():
             print("  Verification skipped (no publisher scan report for this version).")
