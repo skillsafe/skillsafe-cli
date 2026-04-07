@@ -58,7 +58,7 @@ First checks if a saved API key in `~/.skillsafe/config.json` is still valid. If
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py scan <path>
 ```
-Runs 11 scan passes:
+Runs 12 scan passes:
 1. **Python AST analysis** — detects `eval()`, `exec()`, `os.system()`, `subprocess.*`, etc.
 2. **JS/TS regex analysis** — detects `eval()`, `new Function()`, `child_process`, etc.
 3. **Secret detection** — AWS keys, GitHub tokens, private keys, generic API keys
@@ -70,6 +70,7 @@ Runs 11 scan passes:
 9. **Structural mimicry** — fake `## Prerequisites` / `## Environment Setup` section headers followed by bundled-script execution references within 10 lines; urgency markers (`**IMPORTANT**`, `> WARNING`) adjacent to script execution (SkillJect SS-SM)
 10. **Composite capability co-occurrence** — escalates when a single file combines process execution + network calls (critical), env reads + network (high), or accumulates 3+ medium findings (high)
 11. **Surplus functionality** — cross-references script capabilities (network, env reads, subprocess, file writes) against `SKILL.md` documentation; flags capabilities present in code but absent from docs
+12. **BOM (Bill of Materials)** — neutral capability inventory cataloging all detected capabilities, permissions, and dependencies
 
 ### Save — Save a skill to the registry (private by default)
 ```bash
@@ -99,7 +100,7 @@ After install, a `.skillsafe.json` metadata file is written into the skill direc
 
 ### Search — Search the registry
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py search "<query>" [--category <c>] [--sort popular|recent|verified|trending|hot] [--limit N] [--page N] [--all]
+python3 <skill-dir>/scripts/skillsafe.py search "<query>" [--category <c>] [--sort popular|recent|verified|trending|hot|relevance|installs|newest|updated|stars|eval_score] [--limit N] [--page N] [--all]
 ```
 Searches publicly shared skills only. Use `--page N` to fetch a specific page, or `--all` to auto-paginate through the entire registry (fetches 100 per batch). Default limit is 20 per page, max is 100.
 

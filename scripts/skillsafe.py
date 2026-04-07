@@ -317,7 +317,7 @@ def require_config() -> Dict[str, Any]:
     """Load config or exit with an error if not configured."""
     cfg = load_config()
     if not cfg.get("api_key"):
-        print("Error: Not authenticated. Run 'skillsafe auth <username>' first.", file=sys.stderr)
+        print("Error: Not authenticated. Run 'skillsafe auth' first.", file=sys.stderr)
         sys.exit(1)
     return cfg
 
@@ -1781,6 +1781,9 @@ def build_file_manifest(path: Path) -> list[dict]:
             if fname.startswith("."):
                 continue
             fpath = Path(dirpath) / fname
+            # Skip non-regular files (sockets, FIFOs, device nodes)
+            if not fpath.is_file():
+                continue
             # Guard against symlinks that escape the skill directory tree
             if fpath.is_symlink():
                 resolved = fpath.resolve()
@@ -3377,14 +3380,37 @@ def cmd_save(args: argparse.Namespace) -> None:
         try:
             raw = yaml_meta_path.read_text()
             # Minimal YAML parser for simple key: "value" lines
+            yaml_desc = None
+            yaml_category = None
+            yaml_tags = None
             for line in raw.splitlines():
                 m = re.match(r'^name:\s*"?@?([^/"]+)/([^/"]+)"?', line)
                 if m:
                     namespace, name = m.group(1), m.group(2)
-                    break
+                    continue
                 m2 = re.match(r'^name:\s*"?([^"@\s]+)"?', line)
                 if m2 and "/" not in m2.group(1):
                     name = m2.group(1)
+                    continue
+                md = re.match(r'^description:\s*"?(.+?)"?\s*$', line)
+                if md:
+                    yaml_desc = md.group(1)
+                    continue
+                mc = re.match(r'^category:\s*"?([^"]+?)"?\s*$', line)
+                if mc:
+                    yaml_category = mc.group(1).strip()
+                    continue
+                mt = re.match(r'^tags:\s*\[(.+)\]\s*$', line)
+                if mt:
+                    yaml_tags = mt.group(1)
+                    continue
+            # Use YAML values as defaults when CLI flags not provided
+            if not description and yaml_desc:
+                description = yaml_desc
+            if not category and yaml_category:
+                category = yaml_category
+            if not tags_raw and yaml_tags:
+                tags_raw = yaml_tags
         except OSError:
             pass
     else:
@@ -4927,7 +4953,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
                 pr = pr * 100
             payload["pass_rate"] = pr
         if test_cases is not None:
-            payload["test_cases"] = int(test_cases)
+            payload["test_cases"] = len(test_cases) if isinstance(test_cases, list) else int(test_cases)
         if pass_count is not None:
             payload["pass_count"] = int(pass_count)
         if model:
