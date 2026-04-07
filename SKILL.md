@@ -52,7 +52,7 @@ Run all commands using `python3` and the script at `scripts/skillsafe.py` inside
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py auth
 ```
-First checks if a saved API key in `~/.skillsafe/config.json` is still valid. If valid, prints account info and exits. If the key is missing, expired, or revoked, opens your browser to sign in (via Google or API key) and saves a new API key. The CLI waits for browser authorization automatically.
+First checks if a saved API key in `~/.skillsafe/config.json` is still valid. If valid, prints account info and exits. If the key is missing, expired, or revoked, opens your browser to sign in (via Google, GitHub, or email) and saves a new API key. The CLI waits for browser authorization automatically.
 
 ### Scan — Security scan a skill directory
 ```bash
@@ -209,6 +209,10 @@ python3 <skill-dir>/scripts/skillsafe.py demo-from-session \
 # Save to file first, inspect, then upload
 python3 <skill-dir>/scripts/skillsafe.py demo-from-session <session.jsonl> \
   --title "<title>" --filter-keyword <keyword> --out demo.json
+
+# Or use --no-upload to save locally without uploading
+python3 <skill-dir>/scripts/skillsafe.py demo-from-session <session.jsonl> \
+  @<ns>/<name> --version <ver> --title "<title>" --no-upload
 
 # Review demo.json, then upload
 python3 <skill-dir>/scripts/skillsafe.py demo demo.json @<ns>/<name> --version <ver>
