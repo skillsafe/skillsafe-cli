@@ -3936,56 +3936,9 @@ def _write_install_metadata(
     name: str,
     version: str,
     tree_hash: str,
-    auto_improve: bool = False,
 ) -> None:
-    """Record install in central index and optionally inject self-improvement frontmatter fields."""
+    """Record install in central index."""
     _register_install(install_dir, namespace, name, version, tree_hash)
-
-    # Only inject self-improvement frontmatter when --auto-improve is passed
-    if not auto_improve:
-        return
-
-    skill_md = install_dir / "SKILL.md"
-    if not skill_md.exists():
-        return
-    try:
-        text = skill_md.read_text(encoding="utf-8", errors="replace")
-        lines = text.splitlines(True)  # keep line endings
-
-        # Find frontmatter boundaries (---\n ... ---\n)
-        if not lines or not lines[0].rstrip() == "---":
-            return  # No frontmatter
-
-        end_idx = None
-        for i in range(1, len(lines)):
-            if lines[i].rstrip() == "---":
-                end_idx = i
-                break
-        if end_idx is None:
-            return  # Malformed frontmatter
-
-        # Parse existing frontmatter fields
-        fm_lines = lines[1:end_idx]
-        existing_keys = set()
-        for line in fm_lines:
-            stripped = line.strip()
-            if ":" in stripped:
-                key = stripped.split(":", 1)[0].strip()
-                existing_keys.add(key)
-
-        # Build fields to inject (only if not already present)
-        inject = []
-        if "improvable" not in existing_keys:
-            inject.append("improvable: true\n")
-        if "registry" not in existing_keys:
-            inject.append(f'registry: "@{namespace}/{name}"\n')
-
-        if inject:
-            # Insert before closing ---
-            new_lines = lines[:end_idx] + inject + lines[end_idx:]
-            skill_md.write_text("".join(new_lines), encoding="utf-8")
-    except OSError:
-        pass
 
 
 def _maybe_hint_global_install(
@@ -4073,7 +4026,7 @@ def _install_to_target(
                     print(dim("\n  No agent config directories detected in this project."))
                     print(dim("  Tip: Use --tool <name> to install directly into a specific agent's directory."))
 
-        _write_install_metadata(install_dir, namespace, name, version, tree_hash, auto_improve=getattr(args, "auto_improve", False))
+        _write_install_metadata(install_dir, namespace, name, version, tree_hash)
     
         return install_dir
 
@@ -4116,7 +4069,7 @@ def _install_to_target(
         print(green(f"\n  Installed @{namespace}/{name}@{version}"))
         print(f"  Location: {install_dir}")
 
-    _write_install_metadata(install_dir, namespace, name, version, tree_hash, auto_improve=getattr(args, "auto_improve", False))
+    _write_install_metadata(install_dir, namespace, name, version, tree_hash)
 
     return install_dir
 
@@ -4166,7 +4119,7 @@ def _install_to_target_archive(
                     print(dim("\n  No agent config directories detected in this project."))
                     print(dim("  Tip: Use --tool <name> to install directly into a specific agent's directory."))
 
-        _write_install_metadata(install_dir, namespace, name, version, tree_hash, auto_improve=getattr(args, "auto_improve", False))
+        _write_install_metadata(install_dir, namespace, name, version, tree_hash)
     
         return install_dir
 
@@ -4217,7 +4170,7 @@ def _install_to_target_archive(
         print(green(f"\n  Installed @{namespace}/{name}@{version}"))
         print(f"  Location: {install_dir}")
 
-    _write_install_metadata(install_dir, namespace, name, version, tree_hash, auto_improve=getattr(args, "auto_improve", False))
+    _write_install_metadata(install_dir, namespace, name, version, tree_hash)
 
     return install_dir
 
@@ -5728,7 +5681,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="Install location: project = tool's subdir in current folder (default), global = tool's global skills dir")
     p_install.add_argument("--skills-dir", help="Override install path directly (ignores --tool and --location)")
     p_install.add_argument("--no-symlink", action="store_true", help="Install to .agents/skills/ without creating agent symlinks")
-    p_install.add_argument("--auto-improve", action="store_true", help="Enable self-improvement: inject improvable: true and registry fields into SKILL.md frontmatter")
 
     # -- search -------------------------------------------------------------
     p_search = subparsers.add_parser("search", help="Search for skills")
