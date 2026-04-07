@@ -113,6 +113,53 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 SKILLS_DIR = CONFIG_DIR / "skills"
 CACHE_DIR = CONFIG_DIR / "cache"
 BLOB_CACHE_DIR = CACHE_DIR / "blobs"
+INSTALLED_INDEX = CONFIG_DIR / "installed.json"
+
+
+def _read_install_index() -> Dict[str, Any]:
+    """Read ~/.skillsafe/installed.json — maps install_dir -> metadata."""
+    if not INSTALLED_INDEX.exists():
+        return {}
+    try:
+        with open(INSTALLED_INDEX) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_install_index(index: Dict[str, Any]) -> None:
+    """Write ~/.skillsafe/installed.json atomically."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = INSTALLED_INDEX.with_suffix(".tmp")
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(index, f, indent=2)
+            f.write("\n")
+        tmp_path.replace(INSTALLED_INDEX)
+    except OSError:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _register_install(install_dir: Path, namespace: str, name: str, version: str, tree_hash: str) -> None:
+    """Record an installed skill in the central index."""
+    index = _read_install_index()
+    index[str(install_dir)] = {
+        "namespace": f"@{namespace}",
+        "name": name,
+        "version": version,
+        "tree_hash": tree_hash,
+        "installed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    _write_install_index(index)
+
+
+def _get_install_meta(install_dir: Path) -> Optional[Dict[str, Any]]:
+    """Look up install metadata for a directory from the central index."""
+    index = _read_install_index()
+    return index.get(str(install_dir))
 
 TOOL_SKILLS_DIRS: Dict[str, Path] = {
     "claude": Path.home() / ".claude" / "skills",
@@ -2881,22 +2928,18 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
     def _collect_from_dir(base_dir: Path) -> None:
         if not base_dir.is_dir():
             return
+        index = _read_install_index()
         for skill_dir in sorted(base_dir.iterdir()):
             if not skill_dir.is_dir():
                 continue
-            meta_path = skill_dir / ".skillsafe.json"
-            if not meta_path.exists():
+            meta = index.get(str(skill_dir))
+            if not meta:
                 continue
-            try:
-                with open(meta_path) as f:
-                    meta = json.load(f)
-                ns = (meta.get("namespace") or meta.get("ns", "")).lstrip("@")
-                nm = meta.get("name", "")
-                ver = meta.get("version", "")
-                if ns and nm and ver:
-                    candidates.append((ns, nm, ver, skill_dir))
-            except (json.JSONDecodeError, OSError):
-                pass
+            ns = (meta.get("namespace") or "").lstrip("@")
+            nm = meta.get("name", "")
+            ver = meta.get("version", "")
+            if ns and nm and ver:
+                candidates.append((ns, nm, ver, skill_dir))
 
     if tool_filter:
         _collect_from_dir(TOOL_SKILLS_DIRS[tool_filter])
@@ -3373,9 +3416,8 @@ def cmd_save(args: argparse.Namespace) -> None:
         print("Error: username not found in config. Run 'skillsafe auth' or 'skillsafe whoami' first.", file=sys.stderr)
         sys.exit(1)
 
-    # Read defaults from skillsafe.yaml if present (preferred), then .skillsafe.json
+    # Read defaults from skillsafe.yaml if present
     yaml_meta_path = path / "skillsafe.yaml"
-    local_meta_path = path / ".skillsafe.json"
     if yaml_meta_path.exists():
         try:
             raw = yaml_meta_path.read_text()
@@ -3414,19 +3456,7 @@ def cmd_save(args: argparse.Namespace) -> None:
         except OSError:
             pass
     else:
-        # Legacy .skillsafe.json fallback
-        if not local_meta_path.exists():
-            print(f"  {yellow('Warning:')} No skillsafe.yaml found in {path}. Run {bold('skillsafe lint')} to validate your skill.")
-        if local_meta_path.exists():
-            try:
-                with open(local_meta_path) as f:
-                    local_meta = json.load(f)
-                if local_meta.get("name"):
-                    name = local_meta["name"]
-                if local_meta.get("namespace"):
-                    namespace = local_meta["namespace"].lstrip("@")
-            except (json.JSONDecodeError, OSError):
-                pass
+        print(f"  {yellow('Warning:')} No skillsafe.yaml found in {path}. Run {bold('skillsafe lint')} to validate your skill.")
 
     _validate_skill_name(name)
 
@@ -3582,28 +3612,6 @@ def cmd_save(args: argparse.Namespace) -> None:
         print(f"  Tree hash:  {server_tree_hash} (verified)")
     if result.get("new_bytes") is not None:
         print(f"  New bytes:  {result.get('new_bytes', 0) / 1024:.1f} KB")
-
-    # Update .skillsafe.json after successful save
-    try:
-        meta_data = {}
-        if local_meta_path.exists():
-            try:
-                with open(local_meta_path) as f:
-                    meta_data = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                pass
-        meta_data.update({
-            "namespace": f"@{namespace}",
-            "name": name,
-            "version": version,
-            "tree_hash": server_tree_hash or tree_hash,
-            "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        })
-        with open(local_meta_path, "w") as f:
-            json.dump(meta_data, f, indent=2)
-            f.write("\n")
-    except OSError:
-        pass
 
     print(f"\n  To share this skill, run:")
     print(f"    skillsafe share @{namespace}/{name} --version {version}")
@@ -3930,22 +3938,8 @@ def _write_install_metadata(
     tree_hash: str,
     auto_improve: bool = False,
 ) -> None:
-    """Write .skillsafe.json and optionally inject self-improvement frontmatter fields after install."""
-    # Write .skillsafe.json
-    try:
-        meta_path = install_dir / ".skillsafe.json"
-        meta_data = {
-            "namespace": f"@{namespace}",
-            "name": name,
-            "version": version,
-            "tree_hash": tree_hash,
-            "installed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
-        with open(meta_path, "w") as f:
-            json.dump(meta_data, f, indent=2)
-            f.write("\n")
-    except OSError:
-        pass
+    """Record install in central index and optionally inject self-improvement frontmatter fields."""
+    _register_install(install_dir, namespace, name, version, tree_hash)
 
     # Only inject self-improvement frontmatter when --auto-improve is passed
     if not auto_improve:
@@ -4812,16 +4806,11 @@ def _list_skills_in_dir(directory: Path) -> List[Tuple[str, str, str]]:
                         break
             except Exception:
                 pass
-        # Read version from .skillsafe.json
+        # Read version from central install index
         ver = ""
-        meta_path = skill_dir / ".skillsafe.json"
-        if meta_path.exists():
-            try:
-                with open(meta_path) as f:
-                    meta = json.load(f)
-                ver = meta.get("version", "")
-            except (json.JSONDecodeError, OSError):
-                pass
+        meta = _get_install_meta(skill_dir)
+        if meta:
+            ver = meta.get("version", "")
         results.append((skill_dir.name, desc, ver))
     return results
 
@@ -5214,7 +5203,7 @@ def _collect_config_files(root: Path) -> List[Tuple[str, bytes]]:
 def _build_skills_manifest(root: Path, platform: str) -> Optional[bytes]:
     """Scan the skills directory and build a skills-manifest.json.
 
-    Each entry captures the registry coordinates from .skillsafe.json (if present)
+    Each entry captures the registry coordinates from the central install index
     or from the SKILL.md frontmatter registry field.  Skills without registry info
     are listed as 'local' source so the user knows they need to publish them.
 
@@ -5226,31 +5215,27 @@ def _build_skills_manifest(root: Path, platform: str) -> Optional[bytes]:
         return None
 
     entries: List[Dict[str, Any]] = []
+    index = _read_install_index()
 
     for item in sorted(skills_dir.iterdir()):
         if not item.is_dir():
             continue
         skill_name = item.name
 
-        # Read .skillsafe.json for registry metadata
-        meta_file = item / ".skillsafe.json"
+        # Read from central install index
         registry_ref: Optional[str] = None
         version: Optional[str] = None
         tree_hash: Optional[str] = None
         share_link: Optional[str] = None
 
-        if meta_file.exists():
-            try:
-                meta = json.loads(meta_file.read_text())
-                namespace = (meta.get("namespace") or "").lstrip("@")
-                name = meta.get("name") or skill_name
-                version = meta.get("version")
-                tree_hash = meta.get("tree_hash")
-                share_link = meta.get("share_link") or meta.get("shareLink")
-                if namespace and name:
-                    registry_ref = f"@{namespace}/{name}"
-            except (json.JSONDecodeError, OSError):
-                pass
+        meta = index.get(str(item))
+        if meta:
+            namespace = (meta.get("namespace") or "").lstrip("@")
+            name = meta.get("name") or skill_name
+            version = meta.get("version")
+            tree_hash = meta.get("tree_hash")
+            if namespace and name:
+                registry_ref = f"@{namespace}/{name}"
 
         # Fallback: read registry field from SKILL.md frontmatter
         if not registry_ref:
