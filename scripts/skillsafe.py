@@ -2970,7 +2970,8 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
     for ns, nm, installed_ver, skill_dir in candidates:
         ref = f"@{ns}/{nm}"
         try:
-            meta = client.get_metadata(ns, nm)
+            # Use auth=True so private skills owned by the user are accessible
+            meta = client.get_metadata(ns, nm, auth=True)
             latest_ver = meta.get("latest_version", "")
             if not latest_ver:
                 print(f"  {ref:<35} {installed_ver:<12} {'?':<12} unknown")
@@ -3553,7 +3554,10 @@ def cmd_save(args: argparse.Namespace) -> None:
                 version_re_resolved = True
                 old_version = version
                 version = client.resolve_next_version(namespace, name)
-                print(f"  {yellow('Version conflict:')} {old_version} already exists, using {bold(version)} instead.")
+                if version == old_version:
+                    print(f"\n  Error: Version {old_version} already exists for this skill.", file=sys.stderr)
+                    sys.exit(1)
+                print(f"  {yellow('Note:')} Version {old_version} already exists. Auto-saving as {bold(version)} instead.")
                 metadata["version"] = version
                 # Re-negotiate with new version
                 try:
@@ -5035,12 +5039,14 @@ def cmd_claim(args: argparse.Namespace) -> None:
         created = data.get("created", False)
 
         if created:
-            print(f"  {green('✓')} Claimed as {bold(f'@{ns}/{nm}')}")
+            print(f"  {green('✓')} Imported as {bold(f'@{ns}/{nm}')}")
         else:
-            print(f"  {bold(f'@{ns}/{nm}')} already exists — updated metadata from GitHub")
+            print(f"  {bold(f'@{ns}/{nm}')} already exists — refreshed metadata from GitHub")
         if ns and nm:
             print(f"\n  View at: https://skillsafe.ai/skill/{ns}/{nm}")
-            print(f"\n  {bold('Next: verify the claim')}")
+            print(f"\n  {bold('Note:')} Importing does not prove ownership. To claim this")
+            print(f"  namespace as a verified publisher, visit your account settings.")
+            print(f"\n  {bold('Next steps:')}")
             print(f"    skillsafe scan <local-path>           — scan skill files")
             print(f"    skillsafe save <local-path>           — save a version")
             print(f"    skillsafe eval @{ns}/{nm} --version 1.0.0 --eval-json eval.json")
