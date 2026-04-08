@@ -3971,17 +3971,19 @@ def cmd_install(args: argparse.Namespace) -> None:
         namespace, name = parse_skill_ref(skill_ref)
         version = getattr(args, "version", None) or ""
 
+        # Fetch metadata (needed for version resolution + publisher trust signal)
+        meta: Optional[Dict[str, Any]] = None
+        try:
+            meta = client.get_metadata(namespace, name, auth=bool(api_key))
+        except SkillSafeError:
+            pass  # Non-fatal — we can still install without metadata
+
         # Step 1: Resolve version
         if not version:
-            print(f"Resolving latest version of {bold(f'@{namespace}/{name}')}...")
-            try:
-                meta = client.get_metadata(namespace, name, auth=bool(api_key))
+            if meta:
                 version = meta.get("latest_version", "")
-                if not version:
-                    print("Error: No published versions found.", file=sys.stderr)
-                    sys.exit(1)
-            except SkillSafeError as e:
-                print(f"Error: {e.message}", file=sys.stderr)
+            if not version:
+                print("Error: No published versions found.", file=sys.stderr)
                 sys.exit(1)
 
         # Validate version format to prevent path traversal via malicious server response
@@ -4009,6 +4011,9 @@ def cmd_install(args: argparse.Namespace) -> None:
             archive_bytes, server_tree_hash = dl_data
             dl_data = archive_bytes  # normalize
             print(f"  Downloaded {len(archive_bytes) / 1024:.1f} KB")
+
+    # Publisher trust signal — used to adjust scan output verbosity
+    publisher_verified = bool(meta and meta.get("publisher_validated"))
 
     # ---------- V2 path (file manifest) ----------
 
@@ -4052,7 +4057,7 @@ def cmd_install(args: argparse.Namespace) -> None:
             print("  Scanning downloaded skill...")
             scanner = Scanner()
             consumer_report = scanner.scan(tmppath, tree_hash=local_tree_hash)
-            _print_scan_results(consumer_report, indent=2)
+            _print_scan_results(consumer_report, indent=2, publisher_verified=publisher_verified)
 
             # Submit verification
             print("\n  Submitting verification report...")
@@ -4094,7 +4099,7 @@ def cmd_install(args: argparse.Namespace) -> None:
             print("  Scanning downloaded skill...")
             scanner = Scanner()
             consumer_report = scanner.scan(tmppath, tree_hash=local_tree_hash)
-            _print_scan_results(consumer_report, indent=2)
+            _print_scan_results(consumer_report, indent=2, publisher_verified=publisher_verified)
 
         # Submit verification
         print("\n  Submitting verification report...")
@@ -5817,13 +5822,41 @@ def _grade_color(grade: str) -> str:
     return red(grade)
 
 
-def _print_scan_results(report: Dict[str, Any], indent: int = 0) -> None:
-    """Pretty-print scan results."""
+def _print_scan_results(report: Dict[str, Any], indent: int = 0, publisher_verified: bool = False) -> None:
+    """Pretty-print scan results.
+
+    When *publisher_verified* is True, output is compact: score line with a
+    verified-publisher tag, and only critical threats are listed individually.
+    When False (default), the full verbose output is shown with an unverified
+    warning when threats are present.
+    """
     prefix = " " * indent
     findings = report.get("findings_summary", [])
     score = report.get("score")
     grade = report.get("grade")
+    threat_count = report.get("findings_count", len(findings))
+    advisory_count = report.get("advisory_count", 0)
 
+    # --- Verified publisher: compact output ---
+    if publisher_verified:
+        if score is not None and grade is not None:
+            grade_str = _grade_color(grade)
+            score_label = green(str(score)) if score >= 80 else (yellow(str(score)) if score >= 60 else red(str(score)))
+            print(f"{prefix}Score: {score_label}/100  Grade: {grade_str}  {green('verified publisher')}")
+        if report.get("clean", True) and not findings:
+            return
+        # Only list critical threats for verified publishers
+        critical_threats = [f for f in findings if f.get("classification", "threat") == "threat" and f.get("severity") == "critical"]
+        if critical_threats:
+            print(f"{prefix}{yellow(f'{len(critical_threats)} critical finding(s)')}")
+            for f in critical_threats:
+                loc = f"{f.get('file', '?')}:{f.get('line', '?')}"
+                print(f"{prefix}  {format_severity('critical')} {loc:<35} {f.get('message', '')}")
+        elif threat_count > 0:
+            print(f"{prefix}{dim(f'{threat_count} non-critical finding(s)')}")
+        return
+
+    # --- Unverified publisher: full verbose output ---
     if score is not None and grade is not None:
         grade_str = _grade_color(grade)
         score_label = green(str(score)) if score >= 80 else (yellow(str(score)) if score >= 60 else red(str(score)))
@@ -5833,8 +5866,6 @@ def _print_scan_results(report: Dict[str, Any], indent: int = 0) -> None:
         print(f"{prefix}{green('No security issues found.')}")
         return
 
-    threat_count = report.get("findings_count", len(findings))
-    advisory_count = report.get("advisory_count", 0)
     total = threat_count + advisory_count
     summary = f"Found {total} issue(s) ({threat_count} threat(s), {advisory_count} advisory(ies))"
     print(f"{prefix}{yellow(summary)}\n")
@@ -5852,6 +5883,9 @@ def _print_scan_results(report: Dict[str, Any], indent: int = 0) -> None:
         ctx = f.get("context", "")
         if ctx:
             print(f"{prefix}           {dim(ctx[:100])}")
+
+    if threat_count > 0:
+        print(f"\n{prefix}{yellow('Review findings carefully — this skill is from an unverified publisher.')}")
 
 
 
