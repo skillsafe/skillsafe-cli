@@ -3522,7 +3522,39 @@ def cmd_scan(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
         report["score"] = score
         report["grade"] = grade
 
-    _print_scan_results(report)
+    # Check publisher verification via API
+    publisher_verified = False
+    ns, nm = None, None
+    # Try skillsafe.yaml first
+    yaml_path = path / "skillsafe.yaml"
+    if yaml_path.exists():
+        try:
+            raw = yaml_path.read_text()
+            for line in raw.splitlines():
+                ym = re.match(r'^name:\s*"?@?([^/"]+)/([^/"]+)"?', line)
+                if ym:
+                    ns, nm = ym.group(1), ym.group(2)
+                    break
+        except OSError:
+            pass
+    # Fallback: check install index for installed skills
+    if not (ns and nm):
+        install_meta = _get_install_meta(path)
+        if install_meta:
+            ns = install_meta.get("namespace", "").lstrip("@") or None
+            nm = install_meta.get("name") or None
+    if ns and nm:
+        cfg = load_config()
+        api_key = cfg.get("api_key")
+        client = SkillSafeClient(api_key=api_key)
+        try:
+            meta = client.get_metadata(ns, nm, auth=bool(api_key))
+            publisher_verified = bool(meta and meta.get("publisher_validated"))
+        except SkillSafeError:
+            pass
+
+    skill_ref = f"@{ns}/{nm}" if ns and nm else ""
+    _print_scan_results(report, publisher_verified=publisher_verified, skill_ref=skill_ref)
 
     # Optionally write report to file
     if getattr(args, "output", None):
@@ -4064,7 +4096,8 @@ def cmd_install(args: argparse.Namespace) -> None:
             print("  Scanning downloaded skill...")
             scanner = Scanner()
             consumer_report = scanner.scan(tmppath, tree_hash=local_tree_hash)
-            _print_scan_results(consumer_report, indent=2, publisher_verified=publisher_verified)
+            _install_ref = f"@{namespace}/{name}"
+            _print_scan_results(consumer_report, indent=2, publisher_verified=publisher_verified, skill_ref=_install_ref)
 
             # Submit verification
             print("\n  Submitting verification report...")
@@ -4106,7 +4139,8 @@ def cmd_install(args: argparse.Namespace) -> None:
             print("  Scanning downloaded skill...")
             scanner = Scanner()
             consumer_report = scanner.scan(tmppath, tree_hash=local_tree_hash)
-            _print_scan_results(consumer_report, indent=2, publisher_verified=publisher_verified)
+            _install_ref = f"@{namespace}/{name}"
+            _print_scan_results(consumer_report, indent=2, publisher_verified=publisher_verified, skill_ref=_install_ref)
 
         # Submit verification
         print("\n  Submitting verification report...")
@@ -5829,11 +5863,11 @@ def _grade_color(grade: str) -> str:
     return red(grade)
 
 
-def _print_scan_results(report: Dict[str, Any], indent: int = 0, publisher_verified: bool = False) -> None:
+def _print_scan_results(report: Dict[str, Any], indent: int = 0, publisher_verified: bool = False, skill_ref: str = "") -> None:
     """Pretty-print scan results.
 
-    When *publisher_verified* is True, output is compact: score line with a
-    verified-publisher tag, and only critical threats are listed individually.
+    When *publisher_verified* is True, output is compact: a Verified Publisher
+    tag (with optional skill_ref handle) and only critical threats listed.
     When False (default), the full verbose output is shown with an unverified
     warning when threats are present.
     """
@@ -5846,10 +5880,10 @@ def _print_scan_results(report: Dict[str, Any], indent: int = 0, publisher_verif
 
     # --- Verified publisher: compact output ---
     if publisher_verified:
-        if score is not None and grade is not None:
-            grade_str = _grade_color(grade)
-            score_label = green(str(score)) if score >= 80 else (yellow(str(score)) if score >= 60 else red(str(score)))
-            print(f"{prefix}Score: {score_label}/100  Grade: {grade_str}  {green('verified publisher')}")
+        label = green('Verified Publisher')
+        if skill_ref:
+            label = f"{bold(skill_ref)} — {label}"
+        print(f"{prefix}{label}")
         if report.get("clean", True) and not findings:
             return
         # Only list critical threats for verified publishers
