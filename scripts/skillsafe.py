@@ -3906,6 +3906,7 @@ def cmd_install(args: argparse.Namespace) -> None:
     name: str = ""
     version: str = ""
     server_tree_hash: str = ""
+    meta: Optional[Dict[str, Any]] = None
 
     if share_id:
         # Share link download path
@@ -3967,12 +3968,18 @@ def cmd_install(args: argparse.Namespace) -> None:
             print(f"Error: Invalid version '{version}' in share link response.", file=sys.stderr)
             sys.exit(1)
 
+        # Try to fetch metadata for publisher trust signal
+        if namespace != "shared":
+            try:
+                meta = client.get_metadata(namespace, name, auth=bool(api_key))
+            except SkillSafeError:
+                pass
+
     else:
         namespace, name = parse_skill_ref(skill_ref)
         version = getattr(args, "version", None) or ""
 
         # Fetch metadata (needed for version resolution + publisher trust signal)
-        meta: Optional[Dict[str, Any]] = None
         try:
             meta = client.get_metadata(namespace, name, auth=bool(api_key))
         except SkillSafeError:
