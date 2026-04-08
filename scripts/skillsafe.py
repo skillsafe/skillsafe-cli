@@ -103,8 +103,8 @@ def _safe_extractall(tar: tarfile.TarFile, path: Union[str, Path]) -> None:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.1.5"
-RULESET_VERSION = "2026.03.15"
+VERSION = "0.1.6"
+RULESET_VERSION = "2026.04.08"
 SCANNER_TOOL = "skillsafe-scanner-py"
 DEFAULT_API_BASE = "https://api.skillsafe.ai"
 
@@ -557,7 +557,7 @@ class Scanner:
         (r"press\s+(?:win|windows|cmd)\s*\+\s*r\s+and", "clickfix_run_dialog", "high", "ClickFix: Windows Run dialog social engineering (SS11)"),
 
         # SS13 – Dangerous file / disk operations
-        (r"\brm\s+(?:-[rRfv]+\s+)*(?:/[^/\s]|~/|~\s|/\s|\$HOME/?[\s;|])", "dangerous_rm_root", "critical", "Dangerous rm targeting root or home directory (SS13)"),
+        (r"\brm\s+(?:-[rRfv]+\s+)*(?:/(?:\s*$|[*\s;|&])|~(?:\s*$|[/\s;|&])|\$HOME(?:\s*$|[/\s;|&*]))", "dangerous_rm_root", "critical", "Dangerous rm targeting root or home directory (SS13)"),
         (r"\bdd\s+.*\bof=/dev/(?:sd[a-z]|hd[a-z]|nvme\d|xvd[a-z]|vd[a-z])", "dangerous_dd_device", "critical", "dd writing to block device — data destruction (SS13)"),
 
         # SS14 – Reconnaissance
@@ -597,6 +597,41 @@ class Scanner:
     ]
 
     _OBFUSCATION_COMPILED: Optional[List[Tuple[re.Pattern, str, str, str]]] = None
+
+    # -- Context-aware classification constants --------------------------------
+
+    # File extensions treated as documentation (for advisory classification)
+    _DOC_FILE_EXTENSIONS: frozenset = frozenset({".md", ".txt", ".rst"})
+
+    # Path segments that indicate documentation/test directories (advisory downgrade)
+    _DOC_PATH_SEGMENTS: frozenset = frozenset({
+        "references", "docs", "examples", "tests", "test",
+    })
+
+    # Instructional/imperative language patterns — if found near a dangerous
+    # pattern in markdown, the finding stays "threat" even inside code fences.
+    # This catches the OpenClaw attack pattern (instructional text + code block).
+    _INSTRUCTIONAL_PATTERNS: List[str] = [
+        r"run\s+this",
+        r"execute\s+this",
+        r"paste\s+this",
+        r"copy\s+and\s+paste",
+        r"type\s+this",
+        r"run\s+the\s+following",
+        r"execute\s+the\s+following",
+        r"you\s+must",
+        r"you\s+need\s+to",
+        r"make\s+sure\s+to\s+run",
+        r"first\s+run",
+        r"prerequisite",
+        r"required\s+step",
+        r"before\s+using",
+        r"before\s+you\s+begin",
+        r"curl\s+.*\|\s*.*sh",
+        r"wget\s+.*&&\s*.*chmod",
+    ]
+
+    _INSTRUCTIONAL_RE: Optional[re.Pattern] = None
 
     # -- base64 deep-scan compiled patterns ---------------------------------
     _B64_RE: Optional[re.Pattern] = None
@@ -704,6 +739,11 @@ class Scanner:
             Scanner._OBFUSCATION_COMPILED = [
                 (re.compile(p, re.UNICODE), rid, sev, msg) for p, rid, sev, msg in Scanner._OBFUSCATION_PATTERNS
             ]
+        if Scanner._INSTRUCTIONAL_RE is None:
+            Scanner._INSTRUCTIONAL_RE = re.compile(
+                "|".join(Scanner._INSTRUCTIONAL_PATTERNS),
+                re.IGNORECASE,
+            )
         if Scanner._B64_RE is None:
             Scanner._B64_RE = re.compile(r'[A-Za-z0-9+/]{40,}={0,2}')
             Scanner._DANGER_RE = re.compile(
@@ -921,25 +961,39 @@ class Scanner:
         # Pass 12: BOM (Bill of Materials) — neutral capability inventory
         bom = self._generate_bom(files, script_cache, path)
 
-        # Build summary (deduplicated list for server comparison)
+        # Context-aware classification pass: label each finding as
+        # "threat" (affects score) or "advisory" (informational, 0 penalty).
+        self._classify_findings(all_findings, path)
+
+        # Build summary (includes ALL findings — both threat and advisory)
         findings_summary = [
-            {"rule_id": f["rule_id"], "severity": f["severity"], "file": f["file"], "line": f["line"], "message": f["message"]}
+            {
+                "rule_id": f["rule_id"],
+                "severity": f["severity"],
+                "file": f["file"],
+                "line": f["line"],
+                "message": f["message"],
+                "classification": f.get("classification", "threat"),
+            }
             for f in all_findings
         ]
 
-        is_clean = len(all_findings) == 0
+        threat_count = sum(1 for f in all_findings if f.get("classification", "threat") == "threat")
+        advisory_count = sum(1 for f in all_findings if f.get("classification") == "advisory")
+        is_clean = threat_count == 0
         score, grade = self._calculate_score(all_findings)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         report: Dict[str, Any] = {
-            "schema_version": "1.1",
+            "schema_version": "1.2",
             "scanner": {
                 "tool": SCANNER_TOOL,
                 "version": VERSION,
                 "ruleset_version": RULESET_VERSION,
             },
             "clean": is_clean,
-            "findings_count": len(all_findings),
+            "findings_count": threat_count,
+            "advisory_count": advisory_count,
             "findings_summary": findings_summary,
             "score": score,
             "grade": grade,
@@ -1747,8 +1801,17 @@ class Scanner:
     # -- Scoring ------------------------------------------------------------
 
     def _calculate_score(self, findings: List[Dict[str, Any]]) -> Tuple[int, str]:
-        """Return (score 0-100, letter grade A+/A/B/C/D/F)."""
-        penalty = sum(self._SEVERITY_PENALTIES.get(f.get("severity", "info"), 0) for f in findings)
+        """Return (score 0-100, letter grade A+/A/B/C/D/F).
+
+        Only ``"threat"`` findings contribute to the penalty.  Findings
+        classified as ``"advisory"`` are informational and carry zero
+        score impact.
+        """
+        penalty = sum(
+            self._SEVERITY_PENALTIES.get(f.get("severity", "info"), 0)
+            for f in findings
+            if f.get("classification", "threat") == "threat"
+        )
         score = max(0, 100 - penalty)
         if score == 100:
             grade = "A+"
@@ -1763,6 +1826,135 @@ class Scanner:
         else:
             grade = "F"
         return score, grade
+
+    # -- Context-aware classification ---------------------------------------
+
+    def _classify_findings(self, findings: List[Dict[str, Any]], root: Path) -> None:
+        """Classify each finding as ``"threat"`` or ``"advisory"`` in-place.
+
+        A finding is ``"advisory"`` (0 score impact) when ALL of:
+          1. The file is a documentation file (.md, .txt, .rst)
+          2. The finding line is inside a markdown code fence
+          3. There is no instructional/imperative language within 5 lines
+             before the finding
+
+        Advisory findings in known doc/test paths also get a severity
+        downgrade (critical->high, high->medium, never below medium).
+        """
+        # Shared caches: raw file lines and code-fence state per file
+        file_lines_cache: Dict[str, List[str]] = {}
+        code_fence_cache: Dict[str, List[bool]] = {}
+
+        for f in findings:
+            rel_path = f.get("file", "")
+            line_no = f.get("line", 0)
+
+            # Determine file extension from the relative path
+            ext = os.path.splitext(rel_path)[1].lower()
+
+            # Default: threat
+            f["classification"] = "threat"
+
+            # Only documentation files can be advisory
+            if ext not in self._DOC_FILE_EXTENSIONS:
+                continue
+
+            # Check if inside a code fence
+            if not self._is_in_code_fence(root, rel_path, line_no, code_fence_cache, file_lines_cache):
+                continue
+
+            # Check for instructional intent in the 5 lines before
+            if self._has_instructional_intent(root, rel_path, line_no, file_lines_cache):
+                # Instructional language nearby — stays "threat"
+                continue
+
+            # All conditions met: classify as advisory
+            f["classification"] = "advisory"
+
+            # Apply severity downgrade for advisory findings in doc/test paths
+            if self._is_doc_path(rel_path):
+                sev = f.get("severity", "")
+                if sev == "critical":
+                    f["severity"] = "high"
+                elif sev == "high":
+                    f["severity"] = "medium"
+
+    def _is_in_code_fence(
+        self,
+        root: Path,
+        rel_path: str,
+        line_no: int,
+        cache: Dict[str, List[bool]],
+        file_lines_cache: Dict[str, List[str]],
+    ) -> bool:
+        """Return True if *line_no* (1-based) is inside a markdown code fence.
+
+        Results are cached per file in *cache* to avoid re-reading.
+        Raw file lines are stored in *file_lines_cache* for reuse by other methods.
+        """
+        if rel_path not in cache:
+            fpath = root / rel_path
+            try:
+                lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+            except Exception:
+                cache[rel_path] = []
+                file_lines_cache[rel_path] = []
+                return False
+            file_lines_cache[rel_path] = lines
+            # Build a boolean list: True = inside fence, False = outside
+            in_fence = False
+            state: List[bool] = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("```") or stripped.startswith("~~~"):
+                    # Toggle fence state (CommonMark supports both ``` and ~~~)
+                    in_fence = not in_fence
+                    state.append(in_fence)
+                else:
+                    state.append(in_fence)
+            cache[rel_path] = state
+
+        state_list = cache[rel_path]
+        if not state_list or line_no < 1 or line_no > len(state_list):
+            return False
+        return state_list[line_no - 1]
+
+    def _has_instructional_intent(
+        self,
+        root: Path,
+        rel_path: str,
+        line_no: int,
+        file_lines_cache: Dict[str, List[str]],
+    ) -> bool:
+        """Check the 5 lines before *line_no* for instructional/imperative language.
+
+        Reuses cached file lines from *file_lines_cache* when available.
+        """
+        if not self._INSTRUCTIONAL_RE:
+            return False
+
+        if rel_path in file_lines_cache:
+            lines = file_lines_cache[rel_path]
+        else:
+            fpath = root / rel_path
+            try:
+                lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
+            except Exception:
+                return False
+            file_lines_cache[rel_path] = lines
+
+        start = max(0, line_no - 6)  # 5 lines before (line_no is 1-based)
+        end = line_no - 1            # exclusive of the finding line itself
+        if start >= end or end < 0:
+            return False
+
+        context_block = "\n".join(lines[start:end])
+        return bool(self._INSTRUCTIONAL_RE.search(context_block))
+
+    def _is_doc_path(self, rel_path: str) -> bool:
+        """Return True if the relative path is under a known doc/test directory."""
+        parts = Path(rel_path).parts
+        return any(p.lower() in self._DOC_PATH_SEGMENTS for p in parts)
 
 
 def _redact_line(line: str) -> str:
@@ -2469,6 +2661,8 @@ def install_from_manifest(
     dest_dir: Path,
     verbose: bool = False,
     install_timeout: float = 600,  # 10 minutes cumulative timeout
+    github_raw_base: Optional[str] = None,
+    skill_name: Optional[str] = None,
 ) -> Tuple[str, int, int]:
     """Download files from a v2 manifest and reconstruct the skill directory.
 
@@ -2541,7 +2735,33 @@ def install_from_manifest(
                         time.sleep(wait)
                 attempt += 1
             if last_err is not None:
-                raise last_err
+                # Blob missing from R2 — try GitHub raw content as fallback
+                if github_raw_base and blob_path:
+                    gh_candidates = [
+                        f"{github_raw_base}/{blob_path}",
+                    ]
+                    if skill_name:
+                        gh_candidates.append(f"{github_raw_base}/skills/{skill_name}/{blob_path}")
+                        gh_candidates.append(f"{github_raw_base}/{skill_name}/{blob_path}")
+                    gh_data: Optional[bytes] = None
+                    for gh_url in gh_candidates:
+                        try:
+                            req = urllib.request.Request(gh_url, headers={"User-Agent": "skillsafe-cli"})
+                            with urllib.request.urlopen(req, timeout=30) as resp:
+                                gh_data = resp.read()
+                            if gh_data is not None:
+                                break
+                        except Exception:
+                            continue
+                    if gh_data is not None:
+                        data = gh_data
+                        if verbose:
+                            print(f"    Fetched from GitHub fallback")
+                        last_err = None
+                    else:
+                        raise last_err
+                else:
+                    raise last_err
 
             # Per-blob size and SHA-256 verification
             if len(data) != blob_size:
@@ -3292,9 +3512,13 @@ def cmd_scan(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
         report["findings_summary"] = [
             f for f in report["findings_summary"] if f["rule_id"] not in ignore_rules
         ]
-        report["findings_count"] = len(report["findings_summary"])
-        report["clean"] = len(report["findings_summary"]) == 0
-        score, grade = scanner._calculate_score(report["findings_summary"])
+        remaining = report["findings_summary"]
+        threat_count = sum(1 for f in remaining if f.get("classification", "threat") == "threat")
+        advisory_count = sum(1 for f in remaining if f.get("classification") == "advisory")
+        report["findings_count"] = threat_count
+        report["advisory_count"] = advisory_count
+        report["clean"] = threat_count == 0
+        score, grade = scanner._calculate_score(remaining)
         report["score"] = score
         report["grade"] = grade
 
@@ -3308,10 +3532,13 @@ def cmd_scan(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
             f.write("\n")
         print(f"\nReport written to {out_path}")
 
-    # --check: exit 1 if any HIGH or CRITICAL findings remain
+    # --check: exit 1 if any HIGH or CRITICAL *threat* findings remain
     if getattr(args, "check", False):
         _high = {"critical", "high"}
-        if any(f.get("severity") in _high for f in report.get("findings_summary", [])):
+        if any(
+            f.get("severity") in _high and f.get("classification", "threat") == "threat"
+            for f in report.get("findings_summary", [])
+        ):
             sys.exit(1)
 
     return report
@@ -3788,13 +4015,31 @@ def cmd_install(args: argparse.Namespace) -> None:
     if dl_format == "files":
         manifest = dl_data
 
+        # Build GitHub raw content base URL for blob fallback
+        _gh_raw_base: Optional[str] = None
+        try:
+            _gh_url = meta.get("github_repo_url", "") if meta else ""
+        except NameError:
+            _gh_url = ""
+        if isinstance(_gh_url, str) and _gh_url.startswith("https://github.com/"):
+            _gh_parts = _gh_url.replace("https://github.com/", "").rstrip("/").split("/")
+            if len(_gh_parts) >= 2:
+                _base = f"https://raw.githubusercontent.com/{_gh_parts[0]}/{_gh_parts[1]}/HEAD"
+                try:
+                    _subpath = meta.get("github_subpath", "") if meta else ""
+                except NameError:
+                    _subpath = ""
+                _gh_raw_base = f"{_base}/{_subpath}" if _subpath else _base
+
         # Reconstruct into a temp dir, scan, then move to final location
         with tempfile.TemporaryDirectory() as tmpdir:
             tmppath = Path(tmpdir)
             print("  Reconstructing skill from manifest...")
             try:
                 local_tree_hash, cached_count, downloaded_count = install_from_manifest(
-                    client, manifest, tmppath, verbose=True
+                    client, manifest, tmppath, verbose=True,
+                    github_raw_base=_gh_raw_base,
+                    skill_name=name,
                 )
             except SkillSafeError as e:
                 print(f"\n  Error: {e.message}", file=sys.stderr)
@@ -5588,12 +5833,22 @@ def _print_scan_results(report: Dict[str, Any], indent: int = 0) -> None:
         print(f"{prefix}{green('No security issues found.')}")
         return
 
-    print(f"{prefix}{yellow(f'Found {len(findings)} issue(s):')}\n")
+    threat_count = report.get("findings_count", len(findings))
+    advisory_count = report.get("advisory_count", 0)
+    total = threat_count + advisory_count
+    summary = f"Found {total} issue(s) ({threat_count} threat(s), {advisory_count} advisory(ies))"
+    print(f"{prefix}{yellow(summary)}\n")
+
     for f in findings:
-        sev = format_severity(f.get("severity", "info"))
+        classification = f.get("classification", "threat")
         loc = f"{f.get('file', '?')}:{f.get('line', '?')}"
         msg = f.get("message", "")
-        print(f"{prefix}  {sev} {loc:<35} {msg}")
+        if classification == "advisory":
+            sev_label = dim("ADVISORY".ljust(8))
+            print(f"{prefix}  {sev_label} {loc:<35} {dim(msg)}")
+        else:
+            sev = format_severity(f.get("severity", "info"))
+            print(f"{prefix}  {sev} {loc:<35} {msg}")
         ctx = f.get("context", "")
         if ctx:
             print(f"{prefix}           {dim(ctx[:100])}")
