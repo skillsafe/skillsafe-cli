@@ -92,7 +92,7 @@ Sharing requires a scan report because SkillSafe's dual-side verification model 
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<skill-name> [--version <ver>] [--skills-dir <dir>] [--tool <name>]
 ```
-Downloads the archive, verifies the tree hash matches, scans the downloaded files, submits a verification report, and installs. By default (no flags), installs into the **current project's `.agents/skills/`** directory and auto-symlinks into detected agent directories (`.claude/skills/`, `.cursor/skills/`, etc.). Use `--location project` to make this explicit. Use `--tool <name> --location global` to install into a known tool's **global** skills directory (`--tool claude` → `~/.claude/skills/`, `--tool cursor`, `--tool windsurf`, `--tool openclaw`). Use `--skills-dir <path>` for any other tool — pass the parent directory and the skill will be placed in a subdirectory named after the skill.
+Downloads the archive, verifies the tree hash matches, scans the downloaded files, submits a verification report, and installs. **AI agents should always pass `--tool <self>`** where `<self>` is the agent's tool name (e.g. `--tool claude` for Claude Code, `--tool cursor` for Cursor). This ensures the skill is installed to the correct location. Without `--tool`, installs into `.agents/skills/` in the current project with auto-symlinks. Use `--tool <name>` to install into the tool's **project-level** skills directory. Add `--location global` for the tool's **global** skills directory (`--tool claude` → `~/.claude/skills/`, `--tool cursor` → `~/.cursor/skills/`, etc.). Use `--skills-dir <path>` for any other tool — pass the parent directory and the skill will be placed in a subdirectory named after the skill.
 
 The install command does more than download — it independently re-scans the files and submits that report to the server, which compares it against the sharer's original scan. This is the consumer side of dual-side verification: if someone tampered with the archive between publishing and download, the tree hash will mismatch and the install will be blocked. Running the scan locally (rather than trusting the server's copy) is what makes this meaningful — it's the consumer's independent check, not just a server-side assertion.
 
@@ -384,7 +384,7 @@ Common user requests and which command to use:
 - "scan this for security issues" -> `scan <path>`
 - "save my skill" / "upload my skill" -> `save <path>` (auto-versions) or `save <path> --version <ver>`
 - "share my skill" / "publish my skill" -> `share @ns/name --version <ver>` (add `--public` for search visibility)
-- "install a skill" -> `install @ns/name` (project default) or `install @ns/name --tool <name>` for global install
+- "install a skill" -> `install @ns/name --tool <self>` where `<self>` is the tool you are running as (e.g. `--tool claude` for Claude Code, `--tool cursor` for Cursor, `--tool windsurf` for Windsurf, etc.). Always include `--tool` so the skill is installed to the correct location for the current agent.
 - "improve this skill" / "make this skill better" / "update the skill instructions" -> edit + save workflow (see "Improving & Iterating on Skills")
 - "push a new version" / "publish my changes" -> `save <path> --changelog "what changed"`
 - "revert to previous version" / "go back to the old skill" / "undo skill changes" -> `install @ns/name --version <old>` (project) or `install @ns/name --version <old> --tool claude` (global)
