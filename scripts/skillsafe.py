@@ -3901,18 +3901,20 @@ def cmd_share(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     api_base = cfg.get("api_base", DEFAULT_API_BASE)
-    share_url = f"{api_base}{result.get('share_url', '')}"
+    web_base = api_base.replace("://api.", "://", 1) if "://api." in api_base else api_base
+    share_id = result.get("share_id", "")
 
     print(green(f"  Share link created."))
-    print(f"  Share ID:    {result.get('share_id')}")
+    print(f"  Share ID:    {share_id}")
     print(f"  Visibility:  {result.get('visibility')}")
     if result.get("expires_at"):
         print(f"  Expires:     {result.get('expires_at')}")
-    print(f"  Share URL:   {bold(share_url)}")
     if visibility == "public":
+        print(f"  Skill page:  {bold(f'{web_base}/skill/{namespace}/{name}')}")
         print(f"\n  This skill is now discoverable via search.")
     else:
-        print(f"\n  Share this URL with others to give them access.")
+        print(f"  Install via: {bold(f'skillsafe install {share_id}')}")
+        print(f"\n  Share the install command with others to give them access.")
 
 
 def cmd_install(args: argparse.Namespace) -> None:
