@@ -4291,7 +4291,11 @@ def _install_to_target(
 
     # Canonical mode: install to .agents/skills/<name>/ and symlink to detected agents
     if _should_use_canonical_mode(args):
-        canonical_base = Path.cwd() / CANONICAL_SKILLS_SUBDIR
+        # Auto-detect: if the CLI itself is installed as a skill, install
+        # siblings into the same skills/ directory so the invoking agent
+        # can discover them without extra configuration.
+        detected_base = _detect_skills_base_from_script()
+        canonical_base = detected_base or (Path.cwd() / CANONICAL_SKILLS_SUBDIR)
         install_dir = canonical_base / name
         try:
             install_dir.mkdir(parents=True, exist_ok=True)
@@ -4307,8 +4311,9 @@ def _install_to_target(
             print(red(f"\n  Error: could not install to {install_dir}: {e}"), file=sys.stderr)
             raise
 
-        # Create symlinks unless --no-symlink
-        if not getattr(args, "no_symlink", False):
+        # Create symlinks unless --no-symlink (skip when using detected base —
+        # the invoking agent already sees the skills/ directory)
+        if not getattr(args, "no_symlink", False) and not detected_base:
             created = _create_agent_symlinks(canonical_base, name, Path.cwd())
             if created:
                 print(f"\n  Symlinked to {len(created)} agent(s):")
@@ -4322,7 +4327,7 @@ def _install_to_target(
                     print(dim("  Tip: Use --tool <name> to install directly into a specific agent's directory."))
 
         _write_install_metadata(install_dir, namespace, name, version, tree_hash)
-    
+
         return install_dir
 
     skills_dir = _resolve_skills_dir(args)
@@ -4381,7 +4386,8 @@ def _install_to_target_archive(
 
     # Canonical mode: install to .agents/skills/<name>/ and symlink to detected agents
     if _should_use_canonical_mode(args):
-        canonical_base = Path.cwd() / CANONICAL_SKILLS_SUBDIR
+        detected_base = _detect_skills_base_from_script()
+        canonical_base = detected_base or (Path.cwd() / CANONICAL_SKILLS_SUBDIR)
         install_dir = canonical_base / name
         try:
             if install_dir.exists():
@@ -4400,8 +4406,8 @@ def _install_to_target_archive(
             print(red(f"\n  Error: could not install to {install_dir}: {e}"), file=sys.stderr)
             raise
 
-        # Create symlinks unless --no-symlink
-        if not getattr(args, "no_symlink", False):
+        # Create symlinks unless --no-symlink (skip when using detected base)
+        if not getattr(args, "no_symlink", False) and not detected_base:
             created = _create_agent_symlinks(canonical_base, name, Path.cwd())
             if created:
                 print(f"\n  Symlinked to {len(created)} agent(s):")
@@ -4415,7 +4421,7 @@ def _install_to_target_archive(
                     print(dim("  Tip: Use --tool <name> to install directly into a specific agent's directory."))
 
         _write_install_metadata(install_dir, namespace, name, version, tree_hash)
-    
+
         return install_dir
 
     skills_dir = _resolve_skills_dir(args)
@@ -5728,6 +5734,33 @@ def _cmd_agent_snapshots(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _detect_skills_base_from_script() -> Optional[Path]:
+    """Auto-detect the skills base directory from the script's own location.
+
+    If skillsafe.py is installed as a skill (e.g. at
+    ``<project>/.agents/skills/skillsafe/scripts/skillsafe.py`` or
+    ``<project>/.claude/skills/skillsafe/scripts/skillsafe.py``), return the
+    parent ``skills/`` directory so sibling skills are installed alongside it.
+
+    Returns None if the script isn't inside a recognizable skills directory.
+    """
+    try:
+        script_path = Path(__file__).resolve()
+        # Expected: <base>/skills/<skillname>/scripts/skillsafe.py
+        #   parts[-1] = skillsafe.py
+        #   parts[-2] = scripts
+        #   parts[-3] = skillsafe (or any skill name)
+        #   parts[-4] = skills (the directory we want to return as parent)
+        parts = script_path.parts
+        if len(parts) >= 5 and parts[-2] == "scripts" and parts[-4] == "skills":
+            candidate = script_path.parent.parent.parent  # -> skills/
+            if candidate.is_dir():
+                return candidate
+    except (ValueError, IndexError, OSError):
+        pass
+    return None
 
 
 def _should_use_canonical_mode(args: argparse.Namespace) -> bool:
