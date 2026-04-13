@@ -4626,7 +4626,7 @@ def cmd_import(args: argparse.Namespace) -> None:
         print(f"  {bold(f'@{namespace}/{name}')} already exists — updated metadata from {source_label}")
 
     if namespace and name:
-        print(f"\n  View at: https://skillsafe.ai/skill/{namespace}/{name}")
+        print(f"\n  View at: https://skillsafe.ai/skill/@{namespace}/{name}")
         print(f"\n  {bold('Next steps:')}")
         print(f"    skillsafe scan <local-path>        — scan and verify the skill files")
         print(f"    skillsafe save <local-path>        — save a version")
@@ -5342,7 +5342,7 @@ def cmd_claim(args: argparse.Namespace) -> None:
         else:
             print(f"  {bold(f'@{ns}/{nm}')} already exists — refreshed metadata from GitHub")
         if ns and nm:
-            print(f"\n  View at: https://skillsafe.ai/skill/{ns}/{nm}")
+            print(f"\n  View at: https://skillsafe.ai/skill/@{ns}/{nm}")
             print(f"\n  {bold('Note:')} Importing does not prove ownership. To claim this")
             print(f"  namespace as a verified publisher, visit your account settings.")
             print(f"\n  {bold('Next steps:')}")
