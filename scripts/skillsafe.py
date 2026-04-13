@@ -5463,34 +5463,62 @@ def _collect_config_files(root: Path) -> List[Tuple[str, bytes]]:
 
 
 def _build_skills_manifest(root: Path, platform: str) -> Optional[bytes]:
-    """Scan the skills directory and build a skills-manifest.json.
+    """Scan for all SKILL.md files under the project and build a skills-manifest.json.
 
-    Each entry captures the registry coordinates from the central install index
-    or from the SKILL.md frontmatter registry field.  Skills without registry info
-    are listed as 'local' source so the user knows they need to publish them.
+    Walks the project directory looking for SKILL.md files in known skill locations
+    (.claude/skills/, .agents/skills/, skills/) and any other directories. Each entry
+    captures the skill name (derived from the SKILL.md path), the relative path to the
+    SKILL.md, and registry coordinates from the install index or frontmatter.
 
-    Returns JSON bytes, or None if no skills directory found.
+    Returns JSON bytes, or None if no skills found.
     """
-    skills_subdir = _PLATFORM_SKILLS_SUBDIRS.get(platform, "skills")
-    skills_dir = root / skills_subdir
-    if not skills_dir.is_dir():
-        return None
-
     entries: List[Dict[str, Any]] = []
     index = _read_install_index()
+    seen_paths: set = set()
 
-    for item in sorted(skills_dir.iterdir()):
-        if not item.is_dir():
-            continue
-        skill_name = item.name
+    # Candidate skill directories (checked in order)
+    candidate_dirs: List[Path] = []
+    # Platform-specific: .claude/skills/, .cursor/skills/, etc.
+    platform_config = {"claude": ".claude", "cursor": ".cursor", "windsurf": ".windsurf", "cline": ".cline", "openclaw": ".openclaw"}
+    config_dir = platform_config.get(platform)
+    if config_dir:
+        candidate_dirs.append(root / config_dir / "skills")
+    # Generic locations
+    candidate_dirs.append(root / ".agents" / "skills")
+    candidate_dirs.append(root / "skills")
 
-        # Read from central install index
+    def _extract_frontmatter(text: str) -> Dict[str, Optional[str]]:
+        """Extract registry and version from SKILL.md frontmatter."""
+        result: Dict[str, Optional[str]] = {"registry": None, "version": None, "title": None}
+        m = re.search(r'^registry:\s*["\']?(@[\w/-]+)["\']?\s*$', text, re.MULTILINE)
+        if m:
+            result["registry"] = m.group(1)
+        mv = re.search(r'^version:\s*["\']?([0-9]+\.[0-9]+\.[0-9][^\s"\']*)["\']?\s*$', text, re.MULTILINE)
+        if mv:
+            result["version"] = mv.group(1)
+        # Extract title from first heading
+        mh = re.search(r'^#\s+(.+)$', text, re.MULTILINE)
+        if mh:
+            result["title"] = mh.group(1).strip()
+        return result
+
+    def _process_skill_md(skill_md: Path) -> None:
+        """Process a single SKILL.md file and add an entry."""
+        rel = str(skill_md.relative_to(root))
+        if rel in seen_paths:
+            return
+        seen_paths.add(rel)
+
+        # Derive skill name from path: use parent dir name
+        skill_dir = skill_md.parent
+        skill_name = skill_dir.name
+
+        # Registry info from install index (check the skill directory)
         registry_ref: Optional[str] = None
         version: Optional[str] = None
         tree_hash: Optional[str] = None
-        share_link: Optional[str] = None
 
-        meta = index.get(str(item))
+        meta = index.get(str(skill_dir))
         if meta:
             namespace = (meta.get("namespace") or "").lstrip("@")
             name = meta.get("name") or skill_name
@@ -5499,32 +5527,44 @@ def _build_skills_manifest(root: Path, platform: str) -> Optional[bytes]:
             if namespace and name:
                 registry_ref = f"@{namespace}/{name}"
 
-        # Fallback: read registry field from SKILL.md frontmatter
-        if not registry_ref:
-            skill_md = item / "SKILL.md"
-            if skill_md.exists():
-                try:
-                    text = skill_md.read_text(errors="replace")
-                    m = re.search(r'^registry:\s*["\']?(@[\w/-]+)["\']?\s*$', text, re.MULTILINE)
-                    if m:
-                        registry_ref = m.group(1)
-                    if not version:
-                        mv = re.search(r'^version:\s*["\']?([0-9]+\.[0-9]+\.[0-9][^\s"\']*)["\']?\s*$', text, re.MULTILINE)
-                        if mv:
-                            version = mv.group(1)
-                except OSError:
-                    pass
+        # Read frontmatter from SKILL.md
+        title: Optional[str] = None
+        try:
+            text = skill_md.read_text(errors="replace")
+            fm = _extract_frontmatter(text)
+            if not registry_ref and fm["registry"]:
+                registry_ref = fm["registry"]
+            if not version and fm["version"]:
+                version = fm["version"]
+            title = fm["title"]
+        except OSError:
+            pass
 
-        entry: Dict[str, Any] = {"name": skill_name, "source": "registry" if registry_ref else "local"}
+        entry: Dict[str, Any] = {
+            "name": skill_name,
+            "path": rel,
+            "source": "registry" if registry_ref else "local",
+        }
+        if title and title.lower() != skill_name.lower():
+            entry["title"] = title
         if registry_ref:
             entry["registry"] = registry_ref
         if version:
             entry["version"] = version
         if tree_hash:
             entry["tree_hash"] = tree_hash
-        if share_link:
-            entry["share_link"] = share_link
         entries.append(entry)
+
+    # Walk candidate directories for SKILL.md files
+    for skills_dir in candidate_dirs:
+        if not skills_dir.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(skills_dir):
+            # Skip hidden dirs (except the top-level candidate itself)
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            for fname in filenames:
+                if fname == "SKILL.md":
+                    _process_skill_md(Path(dirpath) / fname)
 
     if not entries:
         return None
@@ -6169,9 +6209,10 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     args = parser.parse_args(argv)
 
-    # Ensure api_base is set in the namespace (subcommand may not define it)
+    # Resolve api_base: CLI flag > config file > default
     if not getattr(args, "api_base", None):
-        args.api_base = DEFAULT_API_BASE
+        cfg_base = load_config().get("api_base")
+        args.api_base = cfg_base or DEFAULT_API_BASE
 
     # Validate --api-base scheme early (allow http only for localhost/127.0.0.1)
     api_base_val = getattr(args, "api_base", DEFAULT_API_BASE) or DEFAULT_API_BASE
