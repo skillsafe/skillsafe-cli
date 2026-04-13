@@ -3162,6 +3162,9 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
                 candidates.append((ns, nm, ver, skill_dir))
 
     if tool_filter:
+        if tool_filter not in TOOL_SKILLS_DIRS:
+            print(f"Error: Unknown tool '{tool_filter}'. Valid tools: {', '.join(sorted(TOOL_SKILLS_DIRS))}")
+            sys.exit(1)
         _collect_from_dir(TOOL_SKILLS_DIRS[tool_filter])
     else:
         for tool_dir in TOOL_SKILLS_DIRS.values():
@@ -3232,6 +3235,7 @@ def cmd_upgrade(args: argparse.Namespace) -> None:
             tool=None,
             location="global",
             skills_dir=str(install_parent),
+            api_base=getattr(args, "api_base", None),
         )
         try:
             cmd_install(fake_args)
