@@ -225,6 +225,26 @@ python3 <skill-dir>/scripts/skillsafe.py demo demo.json @<ns>/<name> --version <
 - Truncates tool outputs longer than 120 lines (configurable with `--max-output-lines N`)
 - Reports how many sensitive values were replaced before uploading
 
+### Agent — Manage agent identities and snapshots
+
+Track and version your AI agent configurations (CLAUDE.md, .cursor/rules, etc.) as snapshots in the SkillSafe registry.
+
+```bash
+# Save a new agent (first time — creates agent identity)
+python3 <skill-dir>/scripts/skillsafe.py agent save <path> --name my-agent --platform claude
+
+# Save a snapshot of an existing agent (has .skillsafe-agent.json)
+python3 <skill-dir>/scripts/skillsafe.py agent save <path>
+
+# List your agents
+python3 <skill-dir>/scripts/skillsafe.py agent list
+
+# List snapshots for an agent
+python3 <skill-dir>/scripts/skillsafe.py agent snapshots <agent-id>
+```
+
+The `agent save` command detects tool-specific config files in the directory (e.g. `CLAUDE.md`, `.cursor/rules`, `.windsurfrules`) and uploads them as a versioned snapshot. Use `--version-tag` to tag snapshots (e.g. `v1.0`, `stable`).
+
 ### Info — Get skill details
 ```bash
 python3 <skill-dir>/scripts/skillsafe.py info @<namespace>/<skill-name>
