@@ -1,7 +1,6 @@
 # Submit a SkillSafe Demo (Crafted Demo Workflow)
 
-Use this workflow when you want to **design and produce a polished showcase demo** for a skill —
-as opposed to `demo-from-session` which records an existing conversation.
+Use this workflow when you want to **design and produce a polished showcase demo** for a skill.
 
 A crafted demo is a multi-turn conversation you script and execute to show a skill's capabilities
 clearly. It appears on `https://skillsafe.ai/demos/` and on the skill's detail page.
@@ -11,8 +10,8 @@ clearly. It appears on `https://skillsafe.ai/demos/` and on the skill's detail p
 1. Identify the target skill: `@namespace/skill-name` and version (use `latest` if not specified).
 2. Fetch the skill's info and install it to read its SKILL.md:
    ```bash
-   python3 <skill-dir>/scripts/skillsafe.py info @namespace/skill-name
-   python3 <skill-dir>/scripts/skillsafe.py install @namespace/skill-name
+   skillsafe info @namespace/skill-name
+   skillsafe install @namespace/skill-name
    ```
 3. Read the installed `SKILL.md` to understand the skill's capabilities and workflows.
 4. Get the SkillSafe API key:

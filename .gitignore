@@ -7,3 +7,7 @@ tests/
 .claude/
 .cursor/
 .windsurf/
+dist/
+build/
+*.egg-info/
+src/*.egg-info/

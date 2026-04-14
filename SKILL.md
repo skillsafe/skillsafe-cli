@@ -7,13 +7,19 @@ allowed-tools: Bash, Read, Write
 
 # SkillSafe — Secured Skill Registry Client
 
-You have access to `skillsafe.py`, a Python client for the SkillSafe skill registry. It scans skills for security issues (dangerous functions, hardcoded secrets, prompt injection), saves them to the registry, shares them via links, installs them with cryptographic verification, and searches the registry.
+You have access to the `skillsafe` CLI, a Python client for the SkillSafe skill registry. It scans skills for security issues (dangerous functions, hardcoded secrets, prompt injection), saves them to the registry, shares them via links, installs them with cryptographic verification, and searches the registry.
 
 ## Setup
 
 ### Installation
 
-Requires Python 3. Download the CLI script and run `update` to pull all remaining files:
+Install via pip (requires Python 3.8+):
+
+```bash
+pip3 install skillsafe
+```
+
+**Fallback** (if pip is unavailable): Download the CLI script directly:
 
 ```bash
 SKILL_DIR="~/.agents/skills/skillsafe"
@@ -22,41 +28,39 @@ curl -fsSL https://skillsafe.ai/scripts/skillsafe.py -o "$SKILL_DIR/scripts/skil
 python3 "$SKILL_DIR/scripts/skillsafe.py" update
 ```
 
-This installs `SKILL.md`, `submit-skill-demo.md`, and `submit-demo-comment.md` alongside the script.
-
-> The example above installs globally for Claude Code (`~/.agents/skills/`). Replace `SKILL_DIR` with the appropriate path for your tool.
-
 ### Updating
 
-To update all skill files to the latest version:
+Update the CLI to the latest version:
 
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py update
+pip3 install --upgrade skillsafe
+# or if using the script fallback:
+skillsafe self-update
 ```
 
 **Upgrade a registry-installed skill** to the latest registry version:
 
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py update @ns/name
+skillsafe update @ns/name
 # or upgrade all installed skills at once:
-python3 <skill-dir>/scripts/skillsafe.py update --all
+skillsafe update --all
 ```
 
 **Installing into the current project:** By default (no flags), `install` places the skill in `.agents/skills/` inside the current working directory and auto-symlinks into detected agent directories (`.claude/skills/`, `.cursor/skills/`, etc.) so it is immediately available. Use `--location project` to make this explicit. Use `--tool <name>` (`claude`, `cursor`, `windsurf`, `codex`, `gemini`, `opencode`, `openclaw`, `cline`, `roo`, `goose`, `copilot`, `kiro`, `trae`, `amp`, `aider`, `vscode`, `antigravity`, `clawdbot`, `droid`, `kilo`) with `--location global` to install globally instead. For any other tool, use `--skills-dir <path>` with that tool's skills directory path.
 
 ## Available Commands
 
-Run all commands using `python3` and the script at `scripts/skillsafe.py` inside this skill's directory.
+Run all commands using the `skillsafe` command.
 
 ### Auth — Sign in via browser
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py auth
+skillsafe auth
 ```
 First checks if a saved API key in `~/.skillsafe/config.json` is still valid. If valid, prints account info and exits. If the key is missing, expired, or revoked, opens your browser to sign in (via Google, GitHub, or email) and saves a new API key. The CLI waits for browser authorization automatically.
 
 ### Scan — Security scan a skill directory
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py scan <path>
+skillsafe scan <path>
 ```
 Runs 12 scan passes:
 1. **Python AST analysis** — detects `eval()`, `exec()`, `os.system()`, `subprocess.*`, etc.
@@ -74,7 +78,7 @@ Runs 12 scan passes:
 
 ### Save — Save a skill to the registry (private by default)
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py save <path> [--version <semver>] [--description <d>] [--category <c>] [--tags <t>] [--changelog <msg>]
+skillsafe save <path> [--version <semver>] [--description <d>] [--category <c>] [--tags <t>] [--changelog <msg>]
 ```
 Scans the skill, computes a SHA-256 tree hash, and uploads to the registry. Skills are saved privately by default — only you can access them. No email verification required. Use `--changelog` to describe what changed in this version (shown in `info`). If `--version` is omitted, the CLI auto-increments the patch version from the latest (e.g., 1.0.2 → 1.0.3). If the skill's content is unchanged from the latest version, the save is skipped.
 
@@ -82,7 +86,7 @@ Saving is intentionally low-friction and private — the goal is to let you chec
 
 ### Share — Create a share link for a saved skill
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py share @<namespace>/<skill-name> --version <ver> [--public] [--expires <1d|7d|30d|never>]
+skillsafe share @<namespace>/<skill-name> --version <ver> [--public] [--expires <1d|7d|30d|never>]
 ```
 Creates a share link for a specific version. By default the link is private (only people with the link can access it). Use `--public` to make the skill discoverable via search. Requires email verification and a scan report on the version.
 
@@ -90,7 +94,7 @@ Sharing requires a scan report because SkillSafe's dual-side verification model 
 
 ### Install — Install a skill from the registry
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<skill-name> [--version <ver>] [--skills-dir <dir>] [--tool <name>]
+skillsafe install @<namespace>/<skill-name> [--version <ver>] [--skills-dir <dir>] [--tool <name>]
 ```
 Downloads the archive, verifies the tree hash matches, scans the downloaded files, submits a verification report, and installs. **AI agents should always pass `--tool <self>`** where `<self>` is the agent's tool name (e.g. `--tool claude` for Claude Code, `--tool cursor` for Cursor). This ensures the skill is installed to the correct location. Without `--tool`, installs into `.agents/skills/` in the current project with auto-symlinks. Use `--tool <name>` to install into the tool's **project-level** skills directory. Add `--location global` for the tool's **global** skills directory (`--tool claude` → `~/.claude/skills/`, `--tool cursor` → `~/.cursor/skills/`, etc.). Use `--skills-dir <path>` for any other tool — pass the parent directory and the skill will be placed in a subdirectory named after the skill.
 
@@ -100,45 +104,45 @@ After install, a `.skillsafe.json` metadata file is written into the skill direc
 
 ### Search — Search the registry
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py search "<query>" [--category <c>] [--sort popular|recent|verified|trending|hot|relevance|installs|newest|updated|stars|eval_score] [--limit N] [--page N] [--all]
+skillsafe search "<query>" [--category <c>] [--sort popular|recent|verified|trending|hot|relevance|installs|newest|updated|stars|eval_score] [--limit N] [--page N] [--all]
 ```
 Searches publicly shared skills only. Use `--page N` to fetch a specific page, or `--all` to auto-paginate through the entire registry (fetches 100 per batch). Default limit is 20 per page, max is 100.
 
 ### Lint — Validate a skillsafe.yaml manifest
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py lint [path]
+skillsafe lint [path]
 ```
 Validates the `skillsafe.yaml` manifest in the given directory (defaults to current directory). Checks: required fields (`name`, `version`, `entrypoint`), valid semver version, entrypoint file exists, description quality, valid category, lowercase tags, and eval pass rate threshold (≥80% required for "Tested" tier). Reports errors (must fix before saving) and warnings (recommendations). Exits with code 1 if any errors are found.
 
 ### Import — Import a GitHub repository as a skill
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py import <github-url>
+skillsafe import <github-url>
 ```
 Imports a GitHub repository as a public placeholder skill on SkillSafe. Accepts bare `github.com/owner/repo` or full `https://github.com/owner/repo` URLs. Creates a public skill entry with metadata fetched from GitHub (name, description, stars, language, license). If the skill already exists, refreshes its GitHub metadata. Use this to quickly register an existing GitHub-hosted skill on SkillSafe, then follow up with `save` to upload your local version and `share` to distribute it.
 
 ### Eval — Upload eval results for a skill version
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py eval @<ns>/<name> --version <ver> [--eval-json <file>]
-python3 <skill-dir>/scripts/skillsafe.py eval @<ns>/<name> --version <ver> --pass-rate 91.7 --test-cases 12 --pass-count 11 [--model claude-opus-4-6]
+skillsafe eval @<ns>/<name> --version <ver> [--eval-json <file>]
+skillsafe eval @<ns>/<name> --version <ver> --pass-rate 91.7 --test-cases 12 --pass-count 11 [--model claude-opus-4-6]
 ```
 Uploads skill-creator eval results to SkillSafe, attaching them to a specific saved version. Use `--eval-json` to pass a skill-creator eval JSON file (parses `summary.pass_rate`, `summary.total`, `summary.passed`, `model`). Alternatively, pass stats directly with `--pass-rate`, `--test-cases`, `--pass-count`. Skills with ≥5 test cases and ≥80% pass rate earn the **✅ Tested** tier, which improves search visibility. If the pass rate dropped from the previous version, a regression warning is shown. Skill-creator eval JSON format: `{ "summary": { "pass_rate": 91.7, "total": 12, "passed": 11 }, "model": "claude-opus-4-6" }`.
 
 ### Benchmark — Upload benchmark results for a skill version
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py benchmark @<ns>/<name> --version <ver> --runs 10 [--avg-time 1.4] [--avg-tokens 850] [--variance 0.2]
+skillsafe benchmark @<ns>/<name> --version <ver> --runs 10 [--avg-time 1.4] [--avg-tokens 850] [--variance 0.2]
 ```
 Uploads benchmark performance data (execution time, token usage, variance) to SkillSafe. Stored alongside eval results on the skill's Evals tab.
 
 ### Claim — Claim a skill from another registry
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py claim github.com/owner/repo
-python3 <skill-dir>/scripts/skillsafe.py claim clawhub:owner/skill-name
+skillsafe claim github.com/owner/repo
+skillsafe claim clawhub:owner/skill-name
 ```
 Claims an externally-hosted skill on SkillSafe. For GitHub sources, creates a SkillSafe listing with GitHub metadata (same as `import`). For ClawHub sources, prints migration instructions. After claiming, run `scan` + `save` + `eval` to earn the Tested tier.
 
 ### Yank — Block downloads of a broken version
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py yank @<namespace>/<skill-name> --version <ver> [--reason <msg>]
+skillsafe yank @<namespace>/<skill-name> --version <ver> [--reason <msg>]
 ```
 Marks a version as yanked — it remains visible in `info` but cannot be downloaded. Use when a published version has a bug or security issue. Other versions are unaffected.
 
@@ -146,7 +150,7 @@ Marks a version as yanked — it remains visible in `info` but cannot be downloa
 
 > To **design and produce a polished showcase demo from scratch** (rather than recording an existing session), read `submit-skill-demo.md` in this skill's directory, or fetch it from `https://skillsafe.ai/submit-skill-demo.md`.
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py demo <demo-json-file> @<ns>/<name> --version <ver> [--title "Title"]
+skillsafe demo <demo-json-file> @<ns>/<name> --version <ver> [--title "Title"]
 ```
 Upload a recorded chat session showing the skill in action. The demo JSON must follow the `skillsafe-demo/1` schema:
 ```json
@@ -167,92 +171,34 @@ Upload a recorded chat session showing the skill in action. The demo JSON must f
 ```
 Fields: `schema` (required), `title` (required, max 200 chars), `messages` array with `role`/`content`/`tool_uses`. Limits: max 5 MB, max 1000 messages. The `--title` flag overrides the title in the JSON.
 
-### Demo from Session — Convert a Claude Code session into a demo and upload it
-
-Use this when the user wants to record the current or a recent conversation as a demo for a skill.
-
-**Step 1 — Find the session file**
-
-Claude Code saves sessions as JSONL files under `~/.claude/projects/<project-dir>/`. The project directory name is the absolute project path with every `/` and `.` replaced by `-`:
-
-```bash
-# Compute the sessions directory for the current project
-python3 -c "import os, re; print(re.sub(r'[/.]', '-', os.getcwd()))"
-# → e.g.  -Users-alice-myproject
-
-# List the most recent sessions for this project
-ls -lt ~/.claude/projects/<project-dir>/*.jsonl 2>/dev/null | head -5
-```
-
-To get the path in one shot:
-```bash
-ls -t ~/.claude/projects/$(python3 -c "import os,re; print(re.sub(r'[/.]','-',os.getcwd()))")/*.jsonl 2>/dev/null | head -3
-```
-
-Pick the most recently modified `.jsonl` file that represents the session you want to record. Avoid the file currently being written (the most recent one if you are mid-conversation); prefer the second most recent for a complete past session.
-
-**Step 2 — Convert, clean, and upload**
-
-```bash
-python3 <skill-dir>/scripts/skillsafe.py demo-from-session \
-  <session.jsonl> \
-  @<ns>/<name> --version <ver> \
-  --title "<what this demo shows>" \
-  --filter-keyword <skill-name>
-```
-
-`--filter-keyword` keeps only messages that mention the skill name (in content or tool inputs/outputs), which removes off-topic turns and keeps the demo focused. Use the skill's short name (e.g. `skillsafe`, `code-review`).
-
-**Step 3 — Preview before uploading (optional)**
-
-```bash
-# Save to file first, inspect, then upload
-python3 <skill-dir>/scripts/skillsafe.py demo-from-session <session.jsonl> \
-  --title "<title>" --filter-keyword <keyword> --out demo.json
-
-# Or use --no-upload to save locally without uploading
-python3 <skill-dir>/scripts/skillsafe.py demo-from-session <session.jsonl> \
-  @<ns>/<name> --version <ver> --title "<title>" --no-upload
-
-# Review demo.json, then upload
-python3 <skill-dir>/scripts/skillsafe.py demo demo.json @<ns>/<name> --version <ver>
-```
-
-**What the command does automatically:**
-- Pairs every `tool_use` block with its `tool_result`, merges into `tool_uses` array
-- Skips system-injected tags (`<local-command-caveat>`, `<system-reminder>`, etc.)
-- Masks sensitive values: API keys, GitHub tokens, AWS keys, Bearer tokens, email addresses, home directory paths
-- Truncates tool outputs longer than 120 lines (configurable with `--max-output-lines N`)
-- Reports how many sensitive values were replaced before uploading
-
 ### Agent — Manage agent identities and snapshots
 
 Track and version your AI agent configurations (CLAUDE.md, .cursor/rules, etc.) as snapshots in the SkillSafe registry.
 
 ```bash
 # Save a new agent (first time — creates agent identity)
-python3 <skill-dir>/scripts/skillsafe.py agent save <path> --name my-agent --platform claude
+skillsafe agent save <path> --name my-agent --platform claude
 
 # Save a snapshot of an existing agent (has .skillsafe-agent.json)
-python3 <skill-dir>/scripts/skillsafe.py agent save <path>
+skillsafe agent save <path>
 
 # List your agents
-python3 <skill-dir>/scripts/skillsafe.py agent list
+skillsafe agent list
 
 # List snapshots for an agent
-python3 <skill-dir>/scripts/skillsafe.py agent snapshots <agent-id>
+skillsafe agent snapshots <agent-id>
 ```
 
 The `agent save` command detects tool-specific config files in the directory (e.g. `CLAUDE.md`, `.cursor/rules`, `.windsurfrules`) and uploads them as a versioned snapshot. Use `--version-tag` to tag snapshots (e.g. `v1.0`, `stable`).
 
 ### Info — Get skill details
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py info @<namespace>/<skill-name>
+skillsafe info @<namespace>/<skill-name>
 ```
 
 ### List — Show all installed skills
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py list
+skillsafe list
 ```
 Shows skills from multiple locations: all known tool directories (Claude Code, Cursor, Windsurf, Codex, Gemini, OpenCode, OpenClaw, Cline, Roo, Goose, Copilot, Kiro, Trae, AMP, Aider, VS Code, Antigravity, ClawdBot, Droid, Kilo Code), SkillSafe registry skills (`~/.skillsafe/skills/`), and project-level skills. Use `--skills-dir <path>` to include additional directories.
 
@@ -263,7 +209,7 @@ Use this workflow when the user wants to edit an existing skill, publish a new v
 ### Step 1 — Install locally for editing
 
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name>
+skillsafe install @<namespace>/<name>
 ```
 
 This installs into `.agents/skills/` in the current project by default (with symlinks to detected agent directories). After install, a `.skillsafe.json` metadata file is written into the skill directory with the namespace, name, version, and tree hash.
@@ -275,7 +221,7 @@ Read and modify `SKILL.md` (instructions) and any supporting files in the instal
 ### Step 3 — Save the improved version
 
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py save <path-to-skill-dir> --changelog "[type] what changed"
+skillsafe save <path-to-skill-dir> --changelog "[type] what changed"
 ```
 
 No `--version` needed — the CLI auto-increments the patch version. If the content is unchanged, the save is skipped. Use changelog prefixes to categorize: `[example]`, `[patch]`, `[instruction]`, `[bugfix]`.
@@ -283,13 +229,13 @@ No `--version` needed — the CLI auto-increments the patch version. If the cont
 ### Step 4 — Optionally share
 
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py share @<namespace>/<name> --version <new-version> [--public]
+skillsafe share @<namespace>/<name> --version <new-version> [--public]
 ```
 
 ### Step 5 — Revert to a previous version if needed
 
 ```bash
-python3 <skill-dir>/scripts/skillsafe.py install @<namespace>/<name> --version <old-version> --tool claude
+skillsafe install @<namespace>/<name> --version <old-version> --tool claude
 ```
 
 ## Self-Improving Skills
@@ -331,7 +277,7 @@ allowed-tools: Bash, Read, Write
 
 4. **Save new version**: The main agent saves the improved skill:
    ```bash
-   python3 <skillsafe-cli>/scripts/skillsafe.py save <skill-dir> --changelog "[patch] replaced jq with python3 fallback"
+   skillsafe save <skill-dir> --changelog "[patch] replaced jq with python3 fallback"
    ```
    The version auto-increments. The changelog describes what was improved and why.
 
@@ -409,7 +355,6 @@ Common user requests and which command to use:
 - "push a new version" / "publish my changes" -> `save <path> --changelog "what changed"`
 - "revert to previous version" / "go back to the old skill" / "undo skill changes" -> `install @ns/name --version <old>` (project) or `install @ns/name --version <old> --tool claude` (global)
 - "yank this version" / "block this version" / "this version is broken" -> `yank @ns/name --version <ver> --reason "..."`
-- "record this session as a demo" / "upload a demo of this skill" / "create a demo from our conversation" -> `demo-from-session` workflow: find the session JSONL, convert with `--filter-keyword <skill-name>`, upload
 - "comment on a demo" / "reply to a comment" / "post a comment on demo dmo_..." -> read `submit-demo-comment.md` in this skill's directory, or fetch `https://skillsafe.ai/submit-demo-comment.md`
 
 ## Configuration

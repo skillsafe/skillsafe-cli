@@ -9,10 +9,11 @@ Works with **Claude Code**, **Cursor**, **Windsurf**, **Codex**, **Gemini CLI**,
 No dependencies — uses only Python stdlib. Requires Python 3.8+.
 
 ```bash
-# Install a public skill (no account required)
-curl -fsSL https://skillsafe.ai/scripts/skillsafe.py | python3 - install @anthropics/pdf
+pip3 install skillsafe
+```
 
-# Or if you already have the CLI:
+```bash
+# Install a public skill (no account required)
 skillsafe install @anthropics/pdf
 
 # Sign in to save and share your own skills
@@ -24,17 +25,17 @@ skillsafe share @myname/my-skill --version 1.0.0
 
 ## Install
 
+### pip (recommended)
+
+```bash
+pip3 install skillsafe
+```
+
+### AI coding tool
+
 Tell your AI coding tool:
 
 > Install skillsafe from https://skillsafe.ai/skill.md
-
-Or manually:
-
-```bash
-mkdir -p <skill-dir>/scripts
-curl -fsSL https://skillsafe.ai/scripts/skillsafe.py -o <skill-dir>/scripts/skillsafe.py
-python3 <skill-dir>/scripts/skillsafe.py update
-```
 
 ## Commands
 
@@ -94,7 +95,6 @@ No account required for public skills. Authenticated installs enable dual-side v
 
 | Command | Description |
 |---------|-------------|
-| `update` | Self-update the CLI from skillsafe.ai |
 | `update @ns/name` | Upgrade a specific installed skill to the latest version |
 | `update --all` | Upgrade all installed skills |
 | `update --all --tool claude` | Upgrade all skills for a specific tool |
@@ -105,8 +105,6 @@ No account required for public skills. Authenticated installs enable dual-side v
 | Command | Description |
 |---------|-------------|
 | `demo <json> @ns/name --version <ver> --title "My demo"` | Upload a demo recording |
-| `demo-from-session <session.jsonl> @ns/name --version <ver> --title "Title"` | Convert a Claude Code session to a demo and upload |
-| `demo-from-session <session.jsonl> --title "Title" --no-upload` | Convert without uploading |
 
 ### Evals & Benchmarks
 
@@ -146,10 +144,12 @@ The scanner runs 12 analysis passes including AST parsing, regex pattern matchin
 ## File Structure
 
 ```
+pyproject.toml             # Package metadata
+src/skillsafe/             # Python package
+    __init__.py            # Public API: Scanner, SkillSafeClient
+    __main__.py            # python -m skillsafe support
+    _cli.py                # CLI implementation (stdlib only)
 SKILL.md                   # Skill definition (source of truth)
-scripts/skillsafe.py       # CLI client (stdlib only, single file)
-submit-skill-demo.md       # Instructions for AI-assisted demo recording
-submit-demo-comment.md     # Instructions for AI-assisted demo commenting
 LICENSE                    # MIT
 ```
 
