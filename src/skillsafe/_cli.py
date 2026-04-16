@@ -3934,7 +3934,11 @@ def cmd_install(args: argparse.Namespace) -> None:
                 pass
 
     else:
-        namespace, name = parse_skill_ref(skill_ref)
+        try:
+            namespace, name = parse_skill_ref(skill_ref)
+        except SkillSafeError as e:
+            print(f"Error: {e.message}", file=sys.stderr)
+            sys.exit(1)
         version = getattr(args, "version", None) or ""
 
         # Fetch metadata (needed for version resolution + publisher trust signal)
