@@ -34,8 +34,6 @@ Update the CLI to the latest version:
 
 ```bash
 pip3 install --upgrade skillsafe
-# or if using the script fallback:
-skillsafe self-update
 ```
 
 **Upgrade a registry-installed skill** to the latest registry version:
